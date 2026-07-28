@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sys
@@ -84,21 +85,41 @@ class UserHookInstallerTests(unittest.TestCase):
         active_command = (
             handler["commandWindows"] if os.name == "nt" else handler["command"]
         )
-        self.assertIn(os.path.abspath(sys.executable), active_command)
-        self.assertIn(" -I ", active_command)
+        if os.name == "nt":
+            encoded_script = active_command.rsplit(" ", 1)[1]
+            active_script = base64.b64decode(encoded_script).decode("utf-16-le")
+        else:
+            active_script = active_command
+        self.assertIn(os.path.abspath(sys.executable), active_script)
+        self.assertIn(" -I ", active_script)
 
     def test_windows_hook_handles_spaces_and_apostrophes_in_python_path(self):
         group = build_user_hook_group(
             python_executable=r"C:\Program Files\O'Brien Python\python.exe",
             platform_name="nt",
+            windows_directory=r"C:\Windows",
         )
         command = group["hooks"][0]["commandWindows"]
-        self.assertTrue(command.startswith("powershell.exe -NoLogo -NoProfile"))
+        self.assertTrue(
+            command.startswith(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe "
+            )
+        )
+        encoded_script = command.rsplit(" ", 1)[1]
+        script = base64.b64decode(encoded_script).decode("utf-16-le")
         self.assertIn(
             r"& 'C:\Program Files\O''Brien Python\python.exe' -I "
             r"-m codex_model_router --hook",
-            command,
+            script,
         )
+
+    def test_windows_hook_rejects_shell_unsafe_system_directory(self):
+        with self.assertRaises(ValueError):
+            build_user_hook_group(
+                python_executable=r"C:\Python\python.exe",
+                platform_name="nt",
+                windows_directory=r"C:\Unsafe Windows",
+            )
 
     def test_installer_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temp_dir:

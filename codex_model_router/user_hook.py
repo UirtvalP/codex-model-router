@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import ntpath
 import os
 import shlex
 import shutil
@@ -19,18 +21,51 @@ ROUTER_STATUS_MESSAGE = "Choosing the subagent model"
 def build_user_hook_group(
     python_executable: Optional[str] = None,
     platform_name: Optional[str] = None,
+    windows_directory: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Pin the hook to the interpreter containing this installed package."""
 
-    executable = os.path.abspath(python_executable or sys.executable)
     platform = platform_name or os.name
+    executable_value = python_executable or sys.executable
+    executable = (
+        ntpath.abspath(executable_value)
+        if platform == "nt"
+        else os.path.abspath(executable_value)
+    )
     if platform == "nt":
         command = "codex-model-router --hook"
         powershell_executable = executable.replace("'", "''")
+        encoded_script = base64.b64encode(
+            ("& '{0}' -I -m codex_model_router --hook".format(
+                powershell_executable
+            )).encode("utf-16-le")
+        ).decode("ascii")
+        windows_root = ntpath.normpath(
+            windows_directory
+            or os.environ.get("SystemRoot")
+            or os.environ.get("WINDIR")
+            or r"C:\Windows"
+        )
+        trusted_powershell = ntpath.join(
+            windows_root,
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+        )
+        if (
+            len(windows_root) < 3
+            or not windows_root[0].isalpha()
+            or windows_root[1:3] != ":\\"
+            or any(character.isspace() for character in trusted_powershell)
+            or any(character in trusted_powershell for character in '"&|<>^')
+        ):
+            raise ValueError(
+                "Windows system directory cannot be represented safely in a hook command"
+            )
         command_windows = (
-            'powershell.exe -NoLogo -NoProfile -NonInteractive -Command '
-            '"& \'{0}\' -I -m codex_model_router --hook"'
-        ).format(powershell_executable)
+            "{0} -NoLogo -NoProfile -NonInteractive -EncodedCommand {1}"
+        ).format(trusted_powershell, encoded_script)
     else:
         command = "{0} -I -m codex_model_router --hook".format(
             shlex.quote(executable)

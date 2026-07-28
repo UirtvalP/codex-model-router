@@ -91,11 +91,9 @@ exact router hook is already present. Start a new Codex task, open `/hooks`, and
 review/trust the new command hook before it can run. Codex officially supports user hooks at
 `~/.codex/hooks.json`; see the [Codex Hooks documentation](https://learn.chatgpt.com/docs/hooks).
 
-The repository also contains a valid Codex plugin manifest and a bundled hook
-under `hooks/hooks.json`. The plugin form resolves its code through
-`PLUGIN_ROOT`, so it remains portable when installed through a marketplace.
-The static file under `examples/` is illustrative; prefer the installer above,
-which pins the exact interpreter containing the package.
+The MVP deliberately does not ship a static hook or plugin hook: only the
+installer can pin the exact Python and Windows PowerShell executables and avoid
+launcher shadowing by an untrusted target checkout.
 
 Only unpinned `spawn_agent` calls are rewritten. If the parent provides a model
 or reasoning effort, the router leaves the call unchanged. Spawned agents are

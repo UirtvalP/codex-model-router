@@ -70,8 +70,10 @@ Codex asks you to review and trust new hooks before they run. Start a new task
 and use `/hooks` after installation. The installer merges rather than replacing
 existing user hooks, pins the active Python interpreter, uses isolated mode to
 prevent target-repository import shadowing, and backs up an existing file before
-changing it. A plugin bundle is also available under `.codex-plugin/plugin.json` and
-`hooks/hooks.json`; plugin hook paths resolve through `PLUGIN_ROOT`.
+changing it. On Windows it also pins the system PowerShell executable and uses
+an encoded inner command, preventing a target checkout from shadowing either
+launcher. Static hook and plugin-hook configs are deliberately not shipped
+because they cannot pin the user's Python interpreter at install time.
 
 The hook does not expose or alter private chain-of-thought. Its intervention
 point is the agent boundary: the subagent task description, model, and reasoning
