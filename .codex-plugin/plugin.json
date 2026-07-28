@@ -1,0 +1,25 @@
+{
+  "name": "codex-model-router",
+  "version": "0.1.0",
+  "description": "A local-first model and reasoning router for Codex tasks and subagents.",
+  "author": {
+    "name": "Saadfk",
+    "url": "https://github.com/Saadfk"
+  },
+  "homepage": "https://github.com/Saadfk/codex-model-router",
+  "repository": "https://github.com/Saadfk/codex-model-router",
+  "keywords": ["codex", "model-routing", "agents", "hooks"],
+  "interface": {
+    "displayName": "Codex Model Router",
+    "shortDescription": "Route Codex models and agents",
+    "longDescription": "Selects a Codex model, reasoning effort, and safe delegation policy with a small Luna classifier plus deterministic guardrails.",
+    "developerName": "Saadfk",
+    "category": "Developer Tools",
+    "capabilities": ["Model routing", "Reasoning effort selection", "Subagent hooks"],
+    "websiteURL": "https://github.com/Saadfk/codex-model-router",
+    "defaultPrompt": [
+      "Route this task with the cheapest Codex model that can finish it."
+    ],
+    "brandColor": "#0B5FFF"
+  }
+}

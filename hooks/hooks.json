@@ -1,0 +1,19 @@
+{
+  "description": "Choose a model and reasoning effort for unpinned Codex subagents.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Agent|spawn_agent)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/tools/codex_route.py\" --hook",
+            "commandWindows": "py -3 \"${PLUGIN_ROOT}/tools/codex_route.py\" --hook",
+            "timeout": 55,
+            "statusMessage": "Choosing the subagent model"
+          }
+        ]
+      }
+    ]
+  }
+}

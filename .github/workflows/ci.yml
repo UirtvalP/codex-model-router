@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.14"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests -p "test_*.py" -v
+      - run: python -c "import json, pathlib; [json.loads(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('.codex-plugin/plugin.json', 'hooks/hooks.json', 'examples/user-hooks.json')]"
+      - run: python -m pip wheel --no-deps --wheel-dir dist .
+      - run: python -m pip install --force-reinstall --no-deps dist/codex_model_router-0.1.0-py3-none-any.whl
+      - run: codex-model-router --help
+        working-directory: ${{ runner.temp }}
+      - run: python -I -m codex_model_router --help
+        working-directory: ${{ runner.temp }}
