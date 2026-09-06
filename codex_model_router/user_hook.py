@@ -6,6 +6,7 @@ import base64
 import json
 import ntpath
 import os
+import site
 import shlex
 import shutil
 import sys
@@ -33,11 +34,17 @@ def build_user_hook_group(
         else os.path.abspath(executable_value)
     )
     if platform == "nt":
+        user_site = os.path.abspath(site.getusersitepackages())
         command = "codex-model-router --hook"
         powershell_executable = executable.replace("'", "''")
+        isolated_script = (
+            "import sys; sys.path.insert(0, r'{0}'); "
+            "from codex_model_router.cli import main; "
+            "raise SystemExit(main(['--hook']))"
+        ).format(user_site.replace("'", "''"))
         encoded_script = base64.b64encode(
-            ("& '{0}' -I -m codex_model_router --hook".format(
-                powershell_executable
+            ("& '{0}' -I -c \"{1}\"".format(
+                powershell_executable, isolated_script.replace('"', '\\"')
             )).encode("utf-16-le")
         ).decode("ascii")
         windows_root = ntpath.normpath(
@@ -72,7 +79,10 @@ def build_user_hook_group(
         )
         command_windows = "codex-model-router.exe --hook"
     return {
-        "matcher": "^(Agent|spawn_agent)$",
+        "matcher": (
+            "^(Agent|spawn_agent|multi_agent_v1__spawn_agent|"
+            "functions\\.collaboration\\.spawn_agent)$"
+        ),
         "hooks": [
             {
                 "type": "command",

@@ -1,18 +1,22 @@
 import base64
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from codex_model_router.router import (
     FALLBACK_MODELS,
+    PRESERVE_MODEL_MARKER,
     ModelCatalog,
     RouteChoice,
     RoutingDecision,
     _catalog_from_payload,
+    _proxy_to_choice,
     append_decision_log,
     append_feedback,
     apply_policy,
@@ -21,12 +25,17 @@ from codex_model_router.router import (
     calibrate_with_feedback,
     classifier_environment,
     classify_heuristically,
+    classify_with_notdiamond,
     discover_catalog,
     dispatch_codex,
     hook_updated_input,
+    normalize_spawn_task_name,
     run_hook,
+    route_task,
 )
 from codex_model_router.user_hook import build_user_hook_group, install_user_hook
+from codex_model_router.dashboard import DASHBOARD_HTML, build_dashboard_payload
+from codex_model_router import cli as cli_module
 
 
 def catalog():
@@ -48,6 +57,80 @@ def choice(**overrides):
     }
     values.update(overrides)
     return RouteChoice(**values)
+
+
+class DashboardTests(unittest.TestCase):
+    def test_dashboard_payload_aggregates_routes_and_feedback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "decisions.jsonl"
+            events = [
+                {
+                    "event": "route_decision",
+                    "timestamp": "2099-01-01T00:00:00+00:00",
+                    "decision_id": "decision-a",
+                    "task_summary": "4 words; type=answer; risk=low",
+                    "notdiamond": {"proxy_model": "claude-haiku-4-5", "session_id": "session-a", "request_ms": 120},
+                    "codex": {"model": "gpt-5.6-luna", "reasoning_effort": "low", "surface": "agent"},
+                    "cache": {"hit": False, "sample_count": 0},
+                    "fallback": {"used": False, "error": None},
+                    "route": {"source": "notdiamond"},
+                    "outcome": "agent_hook",
+                },
+                {
+                    "event": "route_decision",
+                    "timestamp": "2099-01-01T00:01:00+00:00",
+                    "decision_id": "decision-b",
+                    "task_name": "Cached test run",
+                    "task_summary": "3 words; type=implement; risk=low",
+                    "notdiamond": {"proxy_model": "claude-sonnet-4.6", "session_id": None, "request_ms": 80},
+                    "codex": {"model": "gpt-5.6-terra", "reasoning_effort": "medium", "surface": "agent"},
+                    "cache": {"hit": True, "sample_count": 5},
+                    "fallback": {"used": True, "error": "timeout"},
+                    "route": {"source": "notdiamond-fallback"},
+                    "outcome": "agent_hook",
+                },
+                {"event": "route_feedback", "decision_id": "decision-b", "rating": "good"},
+            ]
+            lines = [json.dumps(events[0]), "not-json"] + [json.dumps(item) for item in events[1:]]
+            path.write_text("\n".join(lines), encoding="utf-8")
+
+            payload = build_dashboard_payload(path)
+
+        self.assertEqual(payload["stats"]["total"], 2)
+        self.assertEqual(payload["stats"]["cache_hits"], 1)
+        self.assertEqual(payload["stats"]["fallbacks"], 1)
+        self.assertEqual(payload["stats"]["avg_request_ms"], 100)
+        self.assertEqual(payload["stats"]["models"], {"luna": 1, "terra": 1})
+        self.assertEqual(payload["log"]["invalid_lines"], 1)
+        self.assertEqual(payload["routes"][0]["task"], "Cached test run")
+        self.assertEqual(payload["routes"][0]["rating"], "good")
+
+    def test_dashboard_payload_handles_missing_log(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            payload = build_dashboard_payload(Path(temp_dir) / "missing.jsonl")
+        self.assertFalse(payload["log"]["exists"])
+        self.assertEqual(payload["stats"]["total"], 0)
+        self.assertEqual(payload["routes"], [])
+
+    def test_dashboard_recognizes_legacy_fallback_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "decisions.jsonl"
+            path.write_text(json.dumps({
+                "event": "route_decision",
+                "decision_id": "legacy-fallback",
+                "codex": {"model": "gpt-5.6-terra", "reasoning_effort": "medium"},
+                "route": {"source": "notdiamond-fallback", "nd_error": "timeout"},
+            }), encoding="utf-8")
+            payload = build_dashboard_payload(path)
+        self.assertEqual(payload["stats"]["fallbacks"], 1)
+        self.assertTrue(payload["routes"][0]["fallback_used"])
+        self.assertEqual(payload["routes"][0]["fallback_error"], "timeout")
+
+    def test_dashboard_is_self_contained_and_refreshes(self):
+        self.assertIn("Codex 路由面板", DASHBOARD_HTML)
+        self.assertIn("/api/routes?limit=1000", DASHBOARD_HTML)
+        self.assertIn("setInterval(load,3000)", DASHBOARD_HTML)
+        self.assertNotIn("https://", DASHBOARD_HTML)
 
 
 class UserHookInstallerTests(unittest.TestCase):
@@ -81,6 +164,8 @@ class UserHookInstallerTests(unittest.TestCase):
 
     def test_installer_pins_the_active_python_interpreter(self):
         group = build_user_hook_group()
+        self.assertIn("multi_agent_v1__spawn_agent", group["matcher"])
+        self.assertIn("functions\\.collaboration\\.spawn_agent", group["matcher"])
         handler = group["hooks"][0]
         active_command = (
             handler["commandWindows"] if os.name == "nt" else handler["command"]
@@ -108,10 +193,10 @@ class UserHookInstallerTests(unittest.TestCase):
         encoded_script = command.rsplit(" ", 1)[1]
         script = base64.b64decode(encoded_script).decode("utf-16-le")
         self.assertIn(
-            r"& 'C:\Program Files\O''Brien Python\python.exe' -I "
-            r"-m codex_model_router --hook",
+            r"& 'C:\Program Files\O''Brien Python\python.exe' -I -c",
             script,
         )
+        self.assertIn("codex_model_router.cli", script)
 
     def test_windows_hook_rejects_shell_unsafe_system_directory(self):
         with self.assertRaises(ValueError):
@@ -461,6 +546,22 @@ class CommandTests(unittest.TestCase):
 
 
 class HookAndLogTests(unittest.TestCase):
+    def test_spawn_task_name_is_normalized_before_hook_output(self):
+        decision = apply_policy(choice(), "Review the local API", catalog(), surface="agent")
+        payload = {
+            "tool_input": {
+                "task_name": "Route-Smoke Test",
+                "message": "Review the local API",
+            }
+        }
+
+        updated = hook_updated_input(payload, decision)
+
+        self.assertEqual(updated["task_name"], "route_smoke_test")
+
+    def test_spawn_task_name_falls_back_when_no_ascii_name_remains(self):
+        self.assertEqual(normalize_spawn_task_name("路由测试"), "routed_task")
+
     def test_hook_preserves_all_args_when_adding_route(self):
         decision = apply_policy(
             choice(
@@ -484,7 +585,7 @@ class HookAndLogTests(unittest.TestCase):
         self.assertEqual(updated["model"], decision.model)
         self.assertEqual(updated["reasoning_effort"], decision.effort)
 
-    def test_hook_noops_when_parent_pins_both_fields(self):
+    def test_hook_overrides_parent_supplied_model_and_effort(self):
         decision = apply_policy(
             choice(),
             "Summarize this text",
@@ -498,39 +599,259 @@ class HookAndLogTests(unittest.TestCase):
                 "reasoning_effort": "low",
             }
         }
-        self.assertIsNone(hook_updated_input(payload, decision))
+        updated = hook_updated_input(payload, decision)
+        self.assertEqual(updated["model"], decision.model)
+        self.assertEqual(updated["reasoning_effort"], decision.effort)
 
-    def test_either_partial_pin_opts_agent_out_of_routing(self):
+    def test_unmarked_parent_model_does_not_opt_agent_out_of_routing(self):
         decision = apply_policy(
             choice(model="gpt-5.6-sol", effort="ultra", task_type="research"),
             "Research several independent options",
             catalog(),
             surface="agent",
         )
-        for pinned in (
-            {"model": "custom-model"},
-            {"reasoning_effort": "ultra"},
-        ):
-            payload = {
-                "tool_input": dict(
-                    {"message": "Research several independent options"},
-                    **pinned,
-                )
+        payload = {
+            "tool_input": {
+                "message": "Research several independent options",
+                "model": "custom-model",
             }
-            with self.subTest(pinned=pinned):
-                self.assertIsNone(hook_updated_input(payload, decision))
+        }
+        updated = hook_updated_input(payload, decision)
+        self.assertEqual(updated["model"], decision.model)
+        self.assertEqual(updated["reasoning_effort"], decision.effort)
 
-    def test_pinned_agent_skips_catalog_and_classifier(self):
+    def test_unmarked_parent_reasoning_effort_is_overridden_by_route(self):
+        payload = {
+            "tool_input": {
+                "message": "Research several independent options",
+                "reasoning_effort": "ultra",
+            }
+        }
+        decision = apply_policy(choice(model="gpt-5.6-sol", effort="high"), payload["tool_input"]["message"], catalog(), surface="agent")
+        updated = hook_updated_input(payload, decision)
+        self.assertEqual(updated["model"], decision.model)
+        self.assertEqual(updated["reasoning_effort"], decision.effort)
+
+    def test_notdiamond_maps_four_claude_capability_proxies(self):
+        from unittest.mock import Mock
+        proxies = {
+            "claude-haiku-4-5": "gpt-5.6-luna",
+            "claude-sonnet-4.6": "gpt-5.6-terra",
+            "claude-opus-4.7": "gpt-5.6-sol",
+            "claude-sonnet-5": "gpt-6-astra",
+        }
+        for proxy, expected in proxies.items():
+            response = Mock()
+            response.__enter__ = lambda self: self
+            response.__exit__ = lambda *args: None
+            response.read.return_value = json.dumps({
+                "providers": [{"provider": "openai", "model": proxy}],
+                "session_id": "session-1",
+            }).encode("utf-8")
+            with self.subTest(proxy=proxy), patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test-key"}), patch("codex_model_router.router.urllib.request.urlopen", return_value=response):
+                selected = classify_with_notdiamond("Implement this task", catalog(), "agent")
+            self.assertEqual(selected.model, expected)
+            self.assertEqual(selected.nd_proxy_model, proxy)
+            self.assertEqual(selected.nd_session_id, "session-1")
+
+    def test_opus_normally_maps_to_sol(self):
+        task = "Review this implementation"
+        decision = apply_policy(
+            choice(
+                model="gpt-5.6-sol",
+                effort="high",
+                task_type="review",
+                source="notdiamond",
+                nd_proxy_model="claude-opus-4.7",
+            ),
+            task,
+            catalog(),
+            surface="agent",
+        )
+        self.assertEqual(decision.model, "gpt-5.6-sol")
+
+    def test_extreme_opus_task_still_maps_to_sol(self):
+        task = "Analyze a difficult cross-service concurrency and consistency root cause"
+        decision = apply_policy(
+            choice(
+                model="gpt-5.6-sol",
+                effort="high",
+                task_type="debug",
+                source="notdiamond",
+                nd_proxy_model="claude-opus-4.7",
+            ),
+            task,
+            catalog(),
+            surface="agent",
+        )
+        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-sol", "high"))
+
+    def test_fable_proxy_maps_to_astra_when_notdiamond_supports_it(self):
+        selected = _proxy_to_choice(
+            "claude-fable-5-1",
+            "Analyze a difficult architecture problem",
+            catalog(),
+            12,
+            "session-fable",
+        )
+        self.assertEqual((selected.model, selected.effort), ("gpt-6-astra", "high"))
+
+    def test_notdiamond_failure_falls_back_to_terra_medium(self):
+        with patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test-key"}), patch("codex_model_router.router.classify_with_notdiamond", side_effect=RuntimeError("timeout")):
+            decision = route_task("Implement a small helper", catalog=catalog(), surface="agent", use_feedback=False, use_cache=False)
+        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-terra", "medium"))
+        self.assertEqual(decision.source, "notdiamond-fallback")
+        self.assertIn("timeout", decision.nd_error)
+
+    def test_similarity_cache_requires_enough_successful_samples(self):
+        task = "Run the parser unit tests"
+        live_choice = choice(
+            model="gpt-5.6-terra",
+            effort="medium",
+            task_type="answer",
+            source="notdiamond",
+            nd_proxy_model="claude-sonnet-4.6",
+        )
+        live_decision = apply_policy(live_choice, task, catalog(), surface="agent")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "decisions.jsonl"
+            for _ in range(4):
+                append_decision_log(task, live_decision, "agent_hook", log_path=path)
+            with patch("codex_model_router.router.classify_with_notdiamond", return_value=live_choice) as router:
+                decision = route_task(
+                    task,
+                    catalog=catalog(),
+                    surface="agent",
+                    feedback_log_path=path,
+                    use_feedback=False,
+                )
+        router.assert_called_once()
+        self.assertEqual(decision.source, "notdiamond")
+        self.assertFalse(decision.cache_hit)
+
+    def test_similarity_cache_skips_notdiamond_after_stable_sample_threshold(self):
+        task = "Run the parser unit tests"
+        live_decision = apply_policy(
+            choice(
+                model="gpt-5.6-terra",
+                effort="medium",
+                task_type="answer",
+                source="notdiamond",
+                nd_proxy_model="claude-sonnet-4.6",
+            ),
+            task,
+            catalog(),
+            surface="agent",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "decisions.jsonl"
+            for _ in range(5):
+                append_decision_log(task, live_decision, "agent_hook", log_path=path)
+            with patch("codex_model_router.router.classify_with_notdiamond") as router:
+                decision = route_task(
+                    "Run parser unit tests",
+                    catalog=catalog(),
+                    surface="agent",
+                    feedback_log_path=path,
+                    use_feedback=False,
+                )
+        router.assert_not_called()
+        self.assertEqual(decision.source, "similarity-cache")
+        self.assertTrue(decision.cache_hit)
+        self.assertEqual(decision.cache_sample_count, 5)
+        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-terra", "medium"))
+
+    def test_recursive_spawn_calls_route_for_each_hook_invocation(self):
+        payload = {"tool_name": "spawn_agent", "tool_input": {"message": "Inspect the module"}}
+        first = apply_policy(choice(model="gpt-5.6-luna"), "Inspect the module", catalog(), surface="agent")
+        second = apply_policy(choice(model="gpt-5.6-sol", effort="high"), "Inspect the module", catalog(), surface="agent")
+        with patch("codex_model_router.router.discover_catalog", return_value=catalog()), patch("codex_model_router.router.classify_with_notdiamond", side_effect=[first, second]) as route:
+            self.assertIsNotNone(run_hook(payload, no_log=True))
+            self.assertIsNotNone(run_hook(payload, no_log=True))
+        self.assertEqual(route.call_count, 2)
+
+    def test_parent_supplied_model_is_still_routed(self):
         payload = {
             "tool_name": "Agent",
             "tool_input": {
                 "message": "Research several independent options",
                 "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
             },
         }
-        with patch("codex_model_router.router.discover_catalog") as discover:
-            self.assertIsNone(run_hook(payload, heuristic_only=False, no_log=True))
+        routed = apply_policy(
+            choice(model="gpt-5.6-luna", effort="low"),
+            payload["tool_input"]["message"],
+            catalog(),
+            surface="agent",
+        )
+        with patch("codex_model_router.router.discover_catalog", return_value=catalog()), patch("codex_model_router.router.route_task", return_value=routed) as route:
+            output = run_hook(payload, heuristic_only=False, no_log=True)
+        route.assert_called_once()
+        updated = output["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(updated["model"], "gpt-5.6-luna")
+        self.assertEqual(updated["reasoning_effort"], "low")
+
+    def test_full_history_fork_is_changed_for_routed_model(self):
+        payload = {
+            "tool_name": "multi_agent_v1__spawn_agent",
+            "tool_input": {
+                "message": "Audit the verification provider contract",
+                "fork_turns": "all",
+            },
+        }
+        routed = apply_policy(
+            choice(model="gpt-5.6-terra", effort="medium"),
+            payload["tool_input"]["message"],
+            catalog(),
+            surface="agent",
+        )
+        with patch("codex_model_router.router.discover_catalog", return_value=catalog()), patch("codex_model_router.router.route_task", return_value=routed):
+            output = run_hook(payload, no_log=True)
+        updated = output["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(updated["fork_turns"], "none")
+        self.assertEqual(updated["model"], "gpt-5.6-terra")
+
+    def test_user_preserve_marker_keeps_explicit_model_and_strips_marker(self):
+        payload = {
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "task_name": "user-pinned-review",
+                "message": PRESERVE_MODEL_MARKER + " Review this patch",
+                "model": "gpt-6-astra",
+                "reasoning_effort": "high",
+            },
+        }
+        with patch("codex_model_router.router.discover_catalog") as discover, patch("codex_model_router.router.route_task") as route, patch("codex_model_router.router.append_decision_log") as log:
+            output = run_hook(payload, no_log=False)
         discover.assert_not_called()
+        route.assert_not_called()
+        log.assert_called_once()
+        self.assertEqual(log.call_args.args[1].source, "explicit-user-model")
+        self.assertEqual(log.call_args.kwargs["outcome"], "agent_hook_user_pinned")
+        updated = output["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(updated["message"], "Review this patch")
+        self.assertEqual(updated["model"], "gpt-6-astra")
+        self.assertEqual(updated["reasoning_effort"], "high")
+
+    def test_preserve_marker_without_model_still_routes_and_is_stripped(self):
+        payload = {
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": PRESERVE_MODEL_MARKER + " Inspect the module",
+            },
+        }
+        routed = apply_policy(
+            choice(model="gpt-5.6-terra", effort="medium"),
+            "Inspect the module",
+            catalog(),
+            surface="agent",
+        )
+        with patch("codex_model_router.router.discover_catalog", return_value=catalog()), patch("codex_model_router.router.route_task", return_value=routed):
+            output = run_hook(payload, no_log=True)
+        updated = output["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(updated["message"], "Inspect the module")
+        self.assertEqual(updated["model"], "gpt-5.6-terra")
 
     def test_log_has_hash_and_features_but_not_raw_prompt(self):
         raw_prompt = "private unique prompt that must not be logged"
@@ -547,6 +868,7 @@ class HookAndLogTests(unittest.TestCase):
                 outcome="route_only",
                 log_path=path,
                 cwd=temp_dir,
+                codex_session_id="parent-session",
             )
             content = path.read_text(encoding="utf-8")
             payload = json.loads(content)
@@ -555,6 +877,52 @@ class HookAndLogTests(unittest.TestCase):
         self.assertNotIn("cwd_name", payload)
         self.assertEqual(len(payload["task_sha256"]), 64)
         self.assertEqual(payload["features"]["words"], 8)
+        self.assertEqual(payload["codex"]["model"], decision.model)
+        self.assertEqual(payload["codex"]["reasoning_effort"], decision.effort)
+        self.assertEqual(payload["codex_session_id"], "parent-session")
+        self.assertIn("Codex {0} ({1})".format(decision.model, decision.effort), payload["display"])
+        self.assertFalse(payload["fallback"]["used"])
+
+
+class CliSpawnRouteTests(unittest.TestCase):
+    def test_spawn_route_outputs_native_spawn_arguments_and_logs(self):
+        routed = apply_policy(
+            choice(model="gpt-5.6-sol", effort="high", task_type="review"),
+            "Review the provider boundary",
+            catalog(),
+            surface="agent",
+        )
+        output = io.StringIO()
+        with patch.object(cli_module, "find_codex_executable", return_value="codex"), patch.object(
+            cli_module, "route_task", return_value=routed
+        ) as route, patch.object(cli_module, "_try_log_decision") as log, redirect_stdout(output):
+            exit_code = cli_module.main(
+                [
+                    "--spawn-route",
+                    "--prompt",
+                    "Review the provider boundary",
+                    "--task-name",
+                    "provider-review",
+                    "--session-id",
+                    "parent-session",
+                ]
+            )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            payload["spawn_input"],
+            {
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+                "fork_turns": "none",
+                "task_name": "provider_review",
+            },
+        )
+        self.assertEqual(route.call_args.kwargs["surface"], "agent")
+        self.assertEqual(log.call_args.kwargs["outcome"], "agent_pre_spawn")
+        self.assertEqual(log.call_args.kwargs["task_name"], "provider_review")
+        self.assertEqual(log.call_args.kwargs["codex_session_id"], "parent-session")
 
     def test_underpowered_feedback_upgrades_the_same_task(self):
         task = "Summarize this paragraph into three bullets"

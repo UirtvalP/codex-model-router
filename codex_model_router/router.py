@@ -1,9 +1,8 @@
 """A small, local-first router for Codex model and reasoning choices.
 
-The router uses a disposable Luna/low Codex call for classification, applies a
-deterministic safety floor, and then launches the real Codex task. It never
-changes the task's approval or sandbox policy unless the caller explicitly
-passes a sandbox value through the launcher.
+Not Diamond only selects a capability proxy; Codex executes the real task.
+The router applies deterministic safety floors and preserves the task's
+approval or sandbox policy unless the caller explicitly passes a sandbox value.
 """
 
 from __future__ import annotations
@@ -16,6 +15,8 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
@@ -24,7 +25,21 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-ROUTER_VERSION = "0.1.0"
+ROUTER_VERSION = "0.6.1"
+PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
+NOTDIAMOND_DEFAULT_URL = "https://api.notdiamond.ai/v2/modelRouter/modelSelect"
+NOTDIAMOND_DEFAULT_TIMEOUT_SECONDS = 8.0
+NOTDIAMOND_DEFAULT_COST_QUALITY_TRADEOFF = 1
+ROUTE_CACHE_DEFAULT_MIN_SAMPLES = 5
+ROUTE_CACHE_DEFAULT_SIMILARITY = 0.78
+ROUTE_CACHE_DEFAULT_MAJORITY = 0.80
+ROUTE_CACHE_DEFAULT_MAX_AGE_DAYS = 7.0
+NOTDIAMOND_PROVIDERS = (
+    {"provider": "anthropic", "model": "claude-haiku-4-5"},
+    {"provider": "anthropic", "model": "claude-sonnet-4.6"},
+    {"provider": "anthropic", "model": "claude-opus-4.7"},
+)
+NOTDIAMOND_DEFAULT_FRONTIER_PROXY = "claude-sonnet-5"
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max", "ultra")
 TASK_TYPES = (
     "answer",
@@ -39,6 +54,7 @@ TASK_TYPES = (
 )
 RISK_LEVELS = ("low", "medium", "high")
 ORCHESTRATIONS = ("single", "multi_agent")
+SPAWN_TASK_NAME_FALLBACK = "routed_task"
 SENSITIVE_API_ENV_KEYS = {
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
@@ -60,6 +76,7 @@ FALLBACK_MODELS = {
     "gpt-5.6-luna": ("low", "medium", "high", "xhigh", "max"),
     "gpt-5.6-terra": ("low", "medium", "high", "xhigh", "max", "ultra"),
     "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
+    "gpt-6-astra": ("low", "medium", "high", "xhigh", "max", "ultra"),
 }
 
 
@@ -89,7 +106,8 @@ class ModelCatalog:
             self.preferred("terra"),
             self.preferred("sol"),
         ]
-        return list(dict.fromkeys(preferred))
+        astra = [model for model in self.models if model.lower().endswith("-astra")]
+        return list(dict.fromkeys(preferred + astra))
 
 
 @dataclass
@@ -107,6 +125,12 @@ class RouteChoice:
     safety: Dict[str, bool] = field(default_factory=dict)
     source: str = "heuristic"
     classifier_ms: Optional[int] = None
+    nd_proxy_model: Optional[str] = None
+    nd_session_id: Optional[str] = None
+    nd_error: Optional[str] = None
+    cache_hit: bool = False
+    cache_sample_count: int = 0
+    cache_similarity: Optional[float] = None
 
 
 @dataclass
@@ -128,6 +152,12 @@ class RoutingDecision:
     classifier_ms: Optional[int]
     safety: Dict[str, bool]
     overrides: List[str] = field(default_factory=list)
+    nd_proxy_model: Optional[str] = None
+    nd_session_id: Optional[str] = None
+    nd_error: Optional[str] = None
+    cache_hit: bool = False
+    cache_sample_count: int = 0
+    cache_similarity: Optional[float] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -174,7 +204,7 @@ def _catalog_from_payload(payload: Mapping[str, Any]) -> ModelCatalog:
         levels = entry.get("supported_reasoning_levels", [])
         if not isinstance(slug, str) or not any(
             slug.lower().endswith("-" + family)
-            for family in ("luna", "terra", "sol")
+            for family in ("luna", "terra", "sol", "astra")
         ):
             continue
         efforts: List[str] = []
@@ -215,7 +245,7 @@ def _read_catalog_cache(path: Path) -> Optional[ModelCatalog]:
             continue
         if not any(
             model.lower().endswith("-" + family)
-            for family in ("luna", "terra", "sol")
+            for family in ("luna", "terra", "sol", "astra")
         ):
             continue
         normalized = tuple(
@@ -616,56 +646,137 @@ def _choice_from_payload(payload: Mapping[str, Any], classifier_ms: int) -> Rout
     )
 
 
-def classify_with_luna(
+def _notdiamond_settings() -> Tuple[str, float, int]:
+    url = os.environ.get("NOTDIAMOND_API_URL", NOTDIAMOND_DEFAULT_URL)
+    try:
+        timeout = max(0.1, float(os.environ.get(
+            "NOTDIAMOND_TIMEOUT_SECONDS",
+            str(NOTDIAMOND_DEFAULT_TIMEOUT_SECONDS),
+        )))
+    except ValueError:
+        timeout = NOTDIAMOND_DEFAULT_TIMEOUT_SECONDS
+    try:
+        tradeoff = int(os.environ.get(
+            "NOTDIAMOND_COST_QUALITY_TRADEOFF",
+            str(NOTDIAMOND_DEFAULT_COST_QUALITY_TRADEOFF),
+        ))
+    except ValueError:
+        tradeoff = NOTDIAMOND_DEFAULT_COST_QUALITY_TRADEOFF
+    return url, timeout, max(0, min(10, tradeoff))
+
+
+def _proxy_candidates() -> List[Dict[str, str]]:
+    candidates = [dict(item) for item in NOTDIAMOND_PROVIDERS]
+    frontier = os.environ.get(
+        "NOTDIAMOND_FRONTIER_PROXY",
+        NOTDIAMOND_DEFAULT_FRONTIER_PROXY,
+    ).strip()
+    if frontier:
+        candidates.append({"provider": "anthropic", "model": frontier})
+    return candidates
+
+
+def _provider_value(value: Any, key: str) -> Optional[str]:
+    if isinstance(value, Mapping):
+        result = value.get(key)
+    else:
+        result = getattr(value, key, None)
+    return str(result) if result else None
+
+
+def _selected_proxy(result: Mapping[str, Any]) -> Tuple[str, Optional[str]]:
+    provider = result.get("provider")
+    if provider is None:
+        providers = result.get("providers")
+        if isinstance(providers, list) and providers:
+            provider = providers[0]
+    model = _provider_value(provider, "model")
+    if model is None:
+        model = _provider_value(result, "model")
+    if model is None and isinstance(result.get("selected_model"), str):
+        model = result["selected_model"]
+    if model is None:
+        raise ValueError("Not Diamond response did not include a selected model")
+    return model, _provider_value(result, "session_id")
+
+
+def _proxy_to_choice(proxy_model: str, task: str, catalog: ModelCatalog, elapsed_ms: int,
+                     session_id: Optional[str]) -> RouteChoice:
+    normalized = proxy_model.lower()
+    if "fable" in normalized or re.search(r"sonnet[-.]?5(?:\b|[-.])", normalized):
+        family, effort = "astra", "high"
+    elif normalized.endswith("luna") or "haiku" in normalized:
+        family, effort = "luna", "low"
+    elif normalized.endswith("terra") or "sonnet" in normalized:
+        family, effort = "terra", "medium"
+    elif normalized.endswith("sol") or "opus" in normalized:
+        family, effort = "sol", "high"
+    else:
+        raise ValueError("Unsupported Not Diamond route model: {0}".format(proxy_model))
+    model = catalog.preferred(family)
+    return RouteChoice(
+        model=model,
+        effort=effort,
+        orchestration="single",
+        task_type=_task_type(task),
+        risk="low",
+        parallelizable=False,
+        confidence=1.0,
+        reason="Not Diamond route-only modelSelect selected {0}.".format(proxy_model),
+        safety=_empty_safety(),
+        source="notdiamond",
+        classifier_ms=elapsed_ms,
+        nd_proxy_model=proxy_model,
+        nd_session_id=session_id,
+    )
+
+
+def classify_with_notdiamond(
     task: str,
     catalog: ModelCatalog,
     surface: str,
-    codex_executable: Optional[str] = None,
     timeout_seconds: float = 20.0,
-    subprocess_runner: Any = subprocess.run,
 ) -> RouteChoice:
-    """Run an isolated, schema-constrained Luna/low classifier call."""
+    """Call Not Diamond's route-only modelSelect endpoint; never executes an LLM."""
 
-    executable = codex_executable or find_codex_executable()
-    luna = catalog.preferred("luna")
+    api_key = os.environ.get("NOTDIAMOND_API_KEY")
+    if not api_key:
+        raise RuntimeError("NOTDIAMOND_API_KEY is not set")
+    url, configured_timeout, tradeoff = _notdiamond_settings()
+    timeout = min(timeout_seconds, configured_timeout)
     started = time.perf_counter()
-    with tempfile.TemporaryDirectory(prefix="codex-router-") as temp_dir:
-        schema_path = str(Path(temp_dir) / "route.schema.json")
-        output_path = str(Path(temp_dir) / "route.json")
-        Path(schema_path).write_text(
-            json.dumps(_classifier_schema(catalog)),
-            encoding="utf-8",
-        )
-        command = build_classifier_command(
-            executable,
-            luna,
-            temp_dir,
-            schema_path,
-            output_path,
-        )
-        completed = subprocess_runner(
-            command,
-            input=_classifier_prompt(task, surface, catalog),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds,
-            check=False,
-            shell=False,
-            env=classifier_environment(),
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()[-600:]
-            raise RuntimeError("Luna classifier failed: " + detail)
-        payload = json.loads(Path(output_path).read_text(encoding="utf-8"))
+    body = {
+        "messages": [
+            {"role": "system", "content": "Route this Codex subagent task by capability."},
+            {"role": "user", "content": _task_excerpt(task)},
+        ],
+        "llm_providers": _proxy_candidates(),
+        "hash_content": True,
+        "cost_quality_tradeoff": tradeoff,
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Not Diamond modelSelect failed: {0}".format(exc)) from exc
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-    return _choice_from_payload(payload, elapsed_ms)
+    proxy_model, session_id = _selected_proxy(payload)
+    return _proxy_to_choice(proxy_model, task, catalog, elapsed_ms, session_id)
 
 
 def _model_family(model: str) -> str:
     lowered = model.lower()
-    for family in ("luna", "terra", "sol"):
+    for family in ("luna", "terra", "sol", "astra"):
         if lowered.endswith("-" + family):
             return family
     return "unknown"
@@ -767,7 +878,7 @@ def apply_policy(
 
     if surface == "agent":
         if orchestration != "single":
-            overrides.append("spawned agent cannot recursively auto-delegate")
+            overrides.append("spawned agent remains single-agent; child spawns route independently")
         orchestration = "single"
         if effort == "ultra":
             effort = _normalize_effort(catalog, model, "xhigh")
@@ -809,6 +920,150 @@ def apply_policy(
         classifier_ms=choice.classifier_ms,
         safety=safety,
         overrides=overrides,
+        nd_proxy_model=choice.nd_proxy_model,
+        nd_session_id=choice.nd_session_id,
+        nd_error=choice.nd_error,
+        cache_hit=choice.cache_hit,
+        cache_sample_count=choice.cache_sample_count,
+        cache_similarity=choice.cache_similarity,
+    )
+
+
+def _cache_number(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _cache_enabled() -> bool:
+    return os.environ.get("CODEX_ROUTER_CACHE_ENABLED", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _cache_tokens(task: str) -> List[str]:
+    normalized = task.lower()
+    normalized = re.sub(r"[a-z]:[/\\][^\s]+|(?:\.{0,2}[/\\])[^\s]+", " <path> ", normalized)
+    normalized = re.sub(r"\b\d+(?:\.\d+)?\b", " <number> ", normalized)
+    tokens = re.findall(r"[a-z0-9_.-]+|<[^>]+>", normalized)
+    for chunk in re.findall(r"[\u3400-\u9fff]+", normalized):
+        if len(chunk) == 1:
+            tokens.append(chunk)
+        else:
+            tokens.extend(chunk[index:index + 2] for index in range(len(chunk) - 1))
+    return sorted(set(token for token in tokens if token))
+
+
+def _cache_features(task: str) -> Dict[str, Any]:
+    tokens = _cache_tokens(task)
+    safety = scan_safety(task)
+    return {
+        "task_key": hashlib.sha256("\n".join(tokens).encode("utf-8")).hexdigest(),
+        "token_hashes": [
+            hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+            for token in tokens
+        ],
+        "task_type": _task_type(task),
+        "active_safety": sorted(key for key, enabled in safety.items() if enabled),
+    }
+
+
+def _cache_similarity(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
+    if left.get("task_type") != right.get("task_type"):
+        return 0.0
+    if left.get("active_safety") != right.get("active_safety"):
+        return 0.0
+    if left.get("task_key") == right.get("task_key"):
+        return 1.0
+    left_tokens = set(left.get("token_hashes") or ())
+    right_tokens = set(right.get("token_hashes") or ())
+    union = left_tokens | right_tokens
+    return len(left_tokens & right_tokens) / len(union) if union else 0.0
+
+
+def route_from_similarity_cache(
+    task: str,
+    catalog: ModelCatalog,
+    surface: str,
+    log_path: Optional[Path] = None,
+) -> Optional[RouteChoice]:
+    """Reuse a stable recent Not Diamond route for highly similar tasks."""
+
+    if not _cache_enabled() or any(scan_safety(task).values()):
+        return None
+    path = log_path or default_log_path()
+    if not path.exists():
+        return None
+    min_samples = int(_cache_number(
+        "CODEX_ROUTER_CACHE_MIN_SAMPLES", ROUTE_CACHE_DEFAULT_MIN_SAMPLES, 2, 100
+    ))
+    similarity_floor = _cache_number(
+        "CODEX_ROUTER_CACHE_SIMILARITY", ROUTE_CACHE_DEFAULT_SIMILARITY, 0.5, 1.0
+    )
+    majority_floor = _cache_number(
+        "CODEX_ROUTER_CACHE_MAJORITY", ROUTE_CACHE_DEFAULT_MAJORITY, 0.5, 1.0
+    )
+    max_age_days = _cache_number(
+        "CODEX_ROUTER_CACHE_MAX_AGE_DAYS", ROUTE_CACHE_DEFAULT_MAX_AGE_DAYS, 0.1, 365
+    )
+    current = _cache_features(task)
+    cutoff = datetime.now(timezone.utc).timestamp() - max_age_days * 86400
+    matches: List[Tuple[Mapping[str, Any], float]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        recent_lines = deque(handle, maxlen=5000)
+    for line in recent_lines:
+        try:
+            record = json.loads(line)
+            route = record.get("route", {})
+            timestamp = datetime.fromisoformat(record["timestamp"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            record.get("event") != "route_decision"
+            or record.get("router_version") != ROUTER_VERSION
+            or route.get("source") != "notdiamond"
+            or route.get("surface") != surface
+            or timestamp < cutoff
+            or not isinstance(record.get("cache_features"), Mapping)
+        ):
+            continue
+        similarity = _cache_similarity(current, record["cache_features"])
+        if similarity >= similarity_floor:
+            matches.append((route, similarity))
+    if len(matches) < min_samples:
+        return None
+    route_counts = Counter(
+        (route.get("nd_proxy_model"), route.get("model"), route.get("effort"))
+        for route, _ in matches
+    )
+    (proxy_model, model, effort), count = route_counts.most_common(1)[0]
+    majority = count / len(matches)
+    if majority < majority_floor or model not in catalog.models:
+        return None
+    winning_similarities = [
+        similarity
+        for route, similarity in matches
+        if (route.get("nd_proxy_model"), route.get("model"), route.get("effort"))
+        == (proxy_model, model, effort)
+    ]
+    return RouteChoice(
+        model=str(model),
+        effort=str(effort),
+        orchestration="single",
+        task_type=str(current["task_type"]),
+        risk="low",
+        parallelizable=False,
+        confidence=majority,
+        reason="Stable recent similar-task route cache hit.",
+        safety=_empty_safety(),
+        source="similarity-cache",
+        classifier_ms=0,
+        nd_proxy_model=str(proxy_model) if proxy_model else None,
+        cache_hit=True,
+        cache_sample_count=len(matches),
+        cache_similarity=sum(winning_similarities) / len(winning_similarities),
     )
 
 
@@ -822,6 +1077,7 @@ def route_task(
     feedback_log_path: Optional[Path] = None,
     feedback_cwd: Optional[str] = None,
     use_feedback: bool = True,
+    use_cache: bool = True,
 ) -> RoutingDecision:
     """Classify and policy-check one task, falling back locally on any failure."""
 
@@ -829,26 +1085,51 @@ def route_task(
     if heuristic_only:
         choice = classify_heuristically(task, active_catalog)
     else:
-        try:
-            choice = classify_with_luna(
-                task,
-                active_catalog,
-                surface,
-                codex_executable=codex_executable,
-                timeout_seconds=classifier_timeout_seconds,
-            )
-        except (
-            KeyError,
-            OSError,
-            TypeError,
-            ValueError,
-            RuntimeError,
-            subprocess.SubprocessError,
-        ):
-            choice = classify_heuristically(task, active_catalog)
-            choice.source = "heuristic-fallback"
-            choice.reason += " Luna classification was unavailable."
+        choice = None
+        if use_cache:
+            try:
+                choice = route_from_similarity_cache(
+                    task, active_catalog, surface, log_path=feedback_log_path
+                )
+            except (OSError, TypeError, ValueError):
+                choice = None
+        if choice is None:
+            try:
+                choice = classify_with_notdiamond(
+                    task,
+                    active_catalog,
+                    surface,
+                    timeout_seconds=classifier_timeout_seconds,
+                )
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+                subprocess.SubprocessError,
+            ) as exc:
+                choice = RouteChoice(
+                    model=active_catalog.preferred("terra"),
+                    effort=_normalize_effort(active_catalog, active_catalog.preferred("terra"), "medium"),
+                    orchestration="single",
+                    task_type=_task_type(task),
+                    risk="medium",
+                    parallelizable=False,
+                    confidence=0.0,
+                    reason="Not Diamond was unavailable; safe Terra/medium fallback.",
+                    safety=scan_safety(task),
+                    source="notdiamond-fallback",
+                    nd_error=str(exc)[:240],
+                )
     decision = apply_policy(choice, task, active_catalog, surface=surface)
+    if choice.source == "notdiamond-fallback":
+        terra = active_catalog.preferred("terra")
+        decision.model = terra
+        decision.effort = _normalize_effort(active_catalog, terra, "medium")
+        decision.orchestration = "single"
+        decision.parallelizable = False
+        decision.overrides.append("Not Diamond failure forced Terra/medium fallback")
     if use_feedback:
         try:
             return calibrate_with_feedback(
@@ -954,6 +1235,8 @@ def append_decision_log(
     cwd: Optional[str] = None,
     exit_code: Optional[int] = None,
     execution_ms: Optional[int] = None,
+    task_name: Optional[str] = None,
+    codex_session_id: Optional[str] = None,
 ) -> Path:
     path = log_path or default_log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -961,12 +1244,54 @@ def append_decision_log(
     logged_route = decision.as_dict()
     # Classifier prose could echo the task, so never persist its free-text reason.
     logged_route.pop("reason", None)
+    proxy_model = decision.nd_proxy_model or "none"
+    fallback_used = decision.source == "notdiamond-fallback"
+    display = (
+        "{0} | source {1} | ND {2} -> Codex {3} ({4}) | "
+        "session {5} | cache {6}/{7} | fallback {8}"
+    ).format(
+        outcome,
+        decision.source,
+        proxy_model,
+        decision.model,
+        decision.effort,
+        decision.nd_session_id or "none",
+        "hit" if decision.cache_hit else "miss",
+        decision.cache_sample_count,
+        "yes" if fallback_used else "no",
+    )
     record = {
         "event": "route_decision",
+        "display": display,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "router_version": ROUTER_VERSION,
         "decision_id": decision.decision_id,
         "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
+        "task_summary": "{0} words; type={1}; risk={2}".format(
+            len(task.split()), decision.task_type, decision.risk
+        ),
+        "task_name": task_name,
+        "codex_session_id": codex_session_id,
+        "cache_features": _cache_features(task),
+        "cache": {
+            "hit": decision.cache_hit,
+            "sample_count": decision.cache_sample_count,
+            "similarity": decision.cache_similarity,
+        },
+        "notdiamond": {
+            "proxy_model": decision.nd_proxy_model,
+            "session_id": decision.nd_session_id,
+            "request_ms": decision.classifier_ms,
+        },
+        "codex": {
+            "model": decision.model,
+            "reasoning_effort": decision.effort,
+            "surface": decision.surface,
+        },
+        "fallback": {
+            "used": fallback_used,
+            "error": decision.nd_error,
+        },
         "cwd_sha256": _cwd_sha256(normalized_cwd),
         "route": logged_route,
         "features": task_features(task, decision),
@@ -1304,17 +1629,79 @@ def hook_updated_input(
     payload: Mapping[str, Any],
     decision: RoutingDecision,
 ) -> Optional[Dict[str, Any]]:
-    """Fill both route fields only when the parent left both unpinned."""
+    """Apply the final routed model and effort while preserving other arguments."""
 
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, Mapping):
         return None
     updated = dict(tool_input)
-    if updated.get("model") or updated.get("reasoning_effort"):
-        return None
+    if updated.get("task_name") is not None:
+        updated["task_name"] = normalize_spawn_task_name(str(updated["task_name"]))
     updated["model"] = decision.model
     updated["reasoning_effort"] = decision.effort
+    # Current Codex/Work full-history forks must inherit the parent model and
+    # therefore cannot accept a routed model override.  A self-contained spawn
+    # prompt lets the child start without copying the full parent transcript.
+    if updated.get("fork_turns") == "all":
+        updated["fork_turns"] = "none"
     return updated
+
+
+def normalize_spawn_task_name(task_name: str) -> str:
+    """Return a spawn_agent-compatible lowercase ASCII task name."""
+
+    normalized = re.sub(r"[^a-z0-9_]+", "_", task_name.lower())
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized or SPAWN_TASK_NAME_FALLBACK
+
+
+def _prepare_hook_input(
+    payload: Mapping[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Strip the internal user-pin marker and report whether it was present."""
+
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, Mapping):
+        return None, False
+    updated = dict(tool_input)
+    if updated.get("task_name") is not None:
+        updated["task_name"] = normalize_spawn_task_name(str(updated["task_name"]))
+    for key in ("message", "task", "prompt"):
+        value = updated.get(key)
+        if not isinstance(value, str):
+            continue
+        stripped = value.lstrip()
+        if not stripped.startswith(PRESERVE_MODEL_MARKER):
+            continue
+        updated[key] = stripped[len(PRESERVE_MODEL_MARKER):].lstrip()
+        return updated, True
+    return updated, False
+
+
+def _explicit_model_decision(
+    task: str,
+    tool_input: Mapping[str, Any],
+) -> RoutingDecision:
+    """Create a loggable decision for a model explicitly pinned by the user."""
+
+    safety = scan_safety(task)
+    return RoutingDecision(
+        decision_id=str(uuid.uuid4()),
+        model=str(tool_input["model"]),
+        effort=str(tool_input.get("reasoning_effort") or "medium"),
+        orchestration="single",
+        task_type=_task_type(task),
+        risk="high" if any(safety.values()) else "low",
+        parallelizable=False,
+        confidence=1.0,
+        reason="model explicitly pinned by the user",
+        source="explicit-user-model",
+        surface="agent",
+        catalog_source="caller",
+        classifier_ms=None,
+        safety=safety,
+        overrides=[],
+    )
 
 
 def task_from_hook(payload: Mapping[str, Any]) -> str:
@@ -1337,16 +1724,51 @@ def run_hook(
     """Route a spawn_agent call at the PreToolUse boundary."""
 
     tool_name = str(payload.get("tool_name", ""))
-    if tool_name not in ("Agent", "spawn_agent"):
+    if tool_name not in (
+        "Agent",
+        "spawn_agent",
+        "multi_agent_v1__spawn_agent",
+        "functions.collaboration.spawn_agent",
+    ):
         return None
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, Mapping):
+    tool_input, preserve_model = _prepare_hook_input(payload)
+    if tool_input is None:
         return None
-    if tool_input.get("model") or tool_input.get("reasoning_effort"):
-        return None
-    task = task_from_hook(payload)
+    prepared_payload = dict(payload)
+    prepared_payload["tool_input"] = tool_input
+    task = task_from_hook(prepared_payload)
     if not task:
         return None
+
+    if preserve_model and tool_input.get("model"):
+        decision = _explicit_model_decision(task, tool_input)
+        if not no_log:
+            try:
+                append_decision_log(
+                    task,
+                    decision,
+                    outcome="agent_hook_user_pinned",
+                    cwd=str(payload.get("cwd") or os.getcwd()),
+                    task_name=(
+                        str(tool_input.get("task_name"))
+                        if tool_input.get("task_name")
+                        else None
+                    ),
+                    codex_session_id=(
+                        str(payload.get("session_id"))
+                        if payload.get("session_id")
+                        else None
+                    ),
+                )
+            except OSError:
+                pass
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": tool_input,
+            }
+        }
 
     active_catalog = discover_catalog()
     decision = route_task(
@@ -1358,7 +1780,7 @@ def run_hook(
         feedback_cwd=str(payload.get("cwd") or os.getcwd()),
         use_feedback=not no_log,
     )
-    updated = hook_updated_input(payload, decision)
+    updated = hook_updated_input(prepared_payload, decision)
     if updated is None:
         return None
     if not no_log:
@@ -1368,6 +1790,16 @@ def run_hook(
                 decision,
                 outcome="agent_hook",
                 cwd=str(payload.get("cwd") or os.getcwd()),
+                task_name=(
+                    str(tool_input.get("task_name"))
+                    if tool_input.get("task_name")
+                    else None
+                ),
+                codex_session_id=(
+                    str(payload.get("session_id"))
+                    if payload.get("session_id")
+                    else None
+                ),
             )
         except OSError:
             pass

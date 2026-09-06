@@ -16,6 +16,7 @@ from .router import (
     default_log_path,
     dispatch_codex,
     find_codex_executable,
+    normalize_spawn_task_name,
     route_task,
     run_hook,
 )
@@ -25,8 +26,8 @@ from .user_hook import install_user_hook
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Use a Luna/low classifier plus deterministic policy to choose the "
-            "Codex model and reasoning effort."
+            "Use Not Diamond route-only modelSelect plus deterministic policy "
+            "to choose the Codex model and reasoning effort."
         )
     )
     parser.add_argument("task", nargs="*", help="Task text; stdin is used when omitted")
@@ -35,6 +36,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--route-only",
         action="store_true",
         help="Print the policy-checked route without launching the real task",
+    )
+    parser.add_argument(
+        "--spawn-route",
+        action="store_true",
+        help=(
+            "Choose and log model arguments for a Codex/Work spawn_agent call "
+            "without launching the child"
+        ),
+    )
+    parser.add_argument(
+        "--task-name",
+        help=(
+            "Optional spawn_agent task name; normalized to lowercase letters, "
+            "digits, and underscores, returned in spawn_input, and logged"
+        ),
+    )
+    parser.add_argument(
+        "--session-id",
+        help="Optional parent Codex session id recorded in the route log",
     )
     parser.add_argument(
         "--heuristic-only",
@@ -179,7 +199,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     codex_executable = find_codex_executable()
     decision = route_task(
         task,
-        surface="root",
+        surface="agent" if args.spawn_route else "root",
         heuristic_only=args.heuristic_only,
         codex_executable=codex_executable,
         classifier_timeout_seconds=args.classifier_timeout,
@@ -188,15 +208,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         use_feedback=not args.no_log,
     )
 
-    if args.route_only:
-        print(json.dumps(decision.as_dict(), indent=2, sort_keys=True))
+    if args.route_only or args.spawn_route:
+        output = decision.as_dict()
+        task_name = normalize_spawn_task_name(args.task_name) if args.task_name else None
+        if args.spawn_route:
+            output["spawn_input"] = {
+                "model": decision.model,
+                "reasoning_effort": decision.effort,
+                "fork_turns": "none",
+            }
+            if task_name:
+                output["spawn_input"]["task_name"] = task_name
+        print(json.dumps(output, indent=2, sort_keys=True))
         if not args.no_log:
             _try_log_decision(
                 task,
                 decision,
-                outcome="route_only",
+                outcome="agent_pre_spawn" if args.spawn_route else "route_only",
                 log_path=log_path,
                 cwd=args.cd,
+                task_name=task_name,
+                codex_session_id=args.session_id,
             )
         return 0
 

@@ -7,6 +7,7 @@ from .router import (
     apply_policy,
     build_codex_command,
     classify_heuristically,
+    classify_with_notdiamond,
     discover_catalog,
     route_task,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "apply_policy",
     "build_codex_command",
     "classify_heuristically",
+    "classify_with_notdiamond",
     "discover_catalog",
     "route_task",
 ]

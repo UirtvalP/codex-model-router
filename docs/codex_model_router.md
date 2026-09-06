@@ -1,15 +1,22 @@
 # Codex Model Router MVP
 
-This MVP puts a small, isolated `gpt-5.6-luna` call in front of a Codex task.
-It selects a model, reasoning effort, and whether the root task warrants Ultra
-delegation. A deterministic policy then raises weak or unsafe recommendations
-before the original prompt is sent unchanged to the selected Codex model.
+This MVP calls Not Diamond's route-only `modelSelect` endpoint in front of a
+Codex task. It selects a capability proxy, maps that proxy to a Codex model and
+reasoning effort, and sends the original prompt unchanged to Codex. Not
+Diamond never executes the task.
 
-This is a two-call path: up to 12,000 characters of the task are sent to the
-classifier first, and that call consumes Codex usage. `--heuristic-only` keeps
-routing entirely local when that extra transmission or latency is undesirable.
+The default capability mapping is Haiku 4.5 → Luna, Sonnet 4.6 → Terra, Opus
+4.7 → Sol, and Not Diamond's currently available Claude frontier proxy
+(`claude-sonnet-5`) → Astra. The router recognizes `claude-fable-5` and
+`claude-fable-5-1` as Astra proxies for when Not Diamond exposes them; set
+`NOTDIAMOND_FRONTIER_PROXY` to the supported Fable model ID at that point.
+Opus always maps to Sol and is never promoted by local keyword matching.
 
-The installed Codex CLI is queried for its Luna, Terra, and Sol catalog, so the
+Up to 12,000 characters are sent to Not Diamond with content hashing enabled.
+`--heuristic-only` keeps routing entirely local. A Not Diamond timeout or API
+failure always falls back to Terra/medium.
+
+The installed Codex CLI is queried for its Luna, Terra, Sol, and Astra catalog, so the
 router only dispatches supported model/effort pairs. The non-sensitive catalog
 is cached for six hours to keep agent routing lean. If classification or model
 discovery fails, a conservative local heuristic takes over.
@@ -54,6 +61,23 @@ Use the zero-cost local fallback:
 
 ## Subagents
 
+Codex/Work may execute its dedicated multi-agent tool through a specialized
+path that does not run `PreToolUse`. In addition, `fork_turns: "all"` requires
+the child to inherit the parent's model. Route immediately before the native
+spawn on that path:
+
+```powershell
+py -3.12 -I -m codex_model_router --spawn-route --task-name "provider_review" --prompt "Review the provider boundary"
+```
+
+The JSON `spawn_input` object is ready to copy into `spawn_agent`; it contains
+the normalized `task_name`, selected `model`, `reasoning_effort`, and
+`fork_turns: "none"`. Task names are restricted to lowercase letters, digits,
+and underscores, with incompatible characters normalized before spawning. This
+route is logged as `agent_pre_spawn`. The user-level `agent-orchestration` Skill makes
+this call automatically before each spawn and uses Terra/medium if routing
+fails.
+
 Install the user-level hook to intercept `spawn_agent` at the `PreToolUse`
 boundary in every repository:
 
@@ -61,10 +85,17 @@ boundary in every repository:
 py -3 -I -m codex_model_router --install-user-hook
 ```
 
-For a fully unpinned subagent, it fills in `model` and `reasoning_effort`. If
-the parent explicitly supplies either field, that spawn opts out of automatic
-routing and proceeds unchanged. An automatically routed spawned agent is never
-assigned Ultra, which avoids recursive delegation.
+On hook-capable execution paths it replaces `model` and `reasoning_effort` on
+every spawn and changes a full-history fork to `fork_turns: "none"`. Values
+filled by a parent Agent are treated as suggestions, so they cannot silently
+bypass routing. Each invocation is routed independently, including recursive
+child-agent spawns.
+
+If the user personally names a child model, the parent adds
+`[codex-router:preserve-model]` at the start of the child message and passes the
+requested route fields. The hook strips that marker, preserves the requested
+model/effort, skips Not Diamond, and still writes an `explicit-user-model`
+record so the dashboard shows what the child actually runs.
 
 Codex asks you to review and trust new hooks before they run. Start a new task
 and use `/hooks` after installation. The installer merges rather than replacing
@@ -85,24 +116,31 @@ relax the child agent's sandbox, approvals, or downstream tool permissions.
 
 ## Safety And Privacy
 
-- The classifier runs in a disposable empty directory with read-only sandbox,
-  the shell tool, multi-agent delegation, and web search disabled, no project
-  rules, no persisted session, and ChatGPT login forced. API-key environment
-  variables are removed from that child process.
-- The classifier receives up to 12,000 characters of the task in a separate
-  Codex request. Use `--heuristic-only` to avoid that extra request.
+- The route-only request receives up to 12,000 characters and uses
+  `NOTDIAMOND_API_KEY`, content hashing, and a bounded timeout. It never
+  executes Codex or another model itself. Use `--heuristic-only` to avoid the
+  network request.
 - The real task retains normal Codex configuration, approval rules, hooks, and
   sandbox. The router only passes a sandbox when you explicitly provide one.
-- Raw prompts and the classifier's free-text reason are never written to the router log. The default log is
+- Raw prompts and free-text route explanations are never written to the router log. The default log is
   `%LOCALAPPDATA%\CodexModelRouter\decisions.jsonl` on Windows and
-  `~/.codex/router/decisions.jsonl` elsewhere; it contains hashes, structured
-  features, the decision, timings, and exit status.
+  `~/.codex/router/decisions.jsonl` elsewhere; it contains a non-sensitive task
+  summary, hashes, structured features, proxy/session information, the decision,
+  fallback errors, timings, and exit status.
 - If the subagent hook fails, the original `spawn_agent` call proceeds unchanged.
 
 High-consequence work involving external writes, deletion, money, credentials,
 security, legal or medical decisions, persisted data, or public deployment is
 forced to Sol/high or stronger and single-agent execution. Ultra is reserved
 for safe root tasks with genuinely independent workstreams.
+
+## Routing dashboard
+
+Run `py -3 -m codex_model_router.dashboard` on Windows or
+`python3 -m codex_model_router.dashboard` on macOS/Linux. The local-only page at
+`http://127.0.0.1:8765/` refreshes every three seconds and summarizes model
+distribution, cache hits, fallbacks, Not Diamond latency, and individual route
+records. The server is read-only and never binds to a LAN interface.
 
 ## Existing Codex History
 
@@ -145,5 +183,6 @@ Root routing applies to tasks launched with `Start-Codex-Routed.ps1` or
 `python -I -m codex_model_router` (also installed as `codex-model-router` when the
 Python scripts directory is on `PATH`). A prompt already submitted in an open
 Codex Desktop task cannot be retroactively moved to another model. Once the
-user hook is installed and trusted, unpinned spawned agents are routed across
-repositories.
+user hook is installed and trusted, hook-capable spawned agents are routed
+across repositories. Codex/Work specialized multi-agent calls use the
+documented `--spawn-route` pre-spawn path instead.
