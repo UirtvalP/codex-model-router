@@ -215,6 +215,10 @@ statistics remain readable for old records. It does not change
 routing decisions or upload log data. Use `--no-browser`, `--port`, or
 `--log-path` to customize startup.
 
+The dashboard uses relative API URLs so it can be mounted below a protected
+reverse-proxy path. Keep the Python server bound to loopback and put HTTPS plus
+authentication at the reverse proxy; do not expose the dashboard port itself.
+
 ## Boundaries
 
 - Root routing works for tasks launched through this CLI or the PowerShell

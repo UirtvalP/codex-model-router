@@ -131,6 +131,11 @@ Run `py -3 -m codex_model_router.dashboard` on Windows or
 distribution, cache hits, fallbacks, evaluation latency and controlled summaries, and individual route
 records. The server is read-only and never binds to a LAN interface.
 
+The page uses a relative `api/routes` request, allowing it to run below an
+authenticated reverse-proxy prefix. Keep the dashboard listener on loopback;
+terminate HTTPS and enforce authentication at the proxy instead of opening the
+dashboard port to the public network.
+
 ## Existing Codex History
 
 Codex installations may have local history under `~/.codex/history.jsonl`,

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-ROUTER_VERSION = "0.8.1"
+ROUTER_VERSION = "0.8.2"
 PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
 CODEX_EVALUATOR_MODEL = "gpt-5.3-codex-spark"
 CODEX_EVALUATOR_EFFORT = "low"
