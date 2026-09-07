@@ -69,7 +69,7 @@ class DashboardTests(unittest.TestCase):
                     "timestamp": "2099-01-01T00:00:00+00:00",
                     "decision_id": "decision-a",
                     "task_summary": "4 words; type=answer; risk=low",
-                    "notdiamond": {"proxy_model": "claude-haiku-4-5", "session_id": "session-a", "request_ms": 120},
+                    "notdiamond": {"proxy_model": "gpt-5.6-luna", "session_id": "session-a", "request_ms": 120},
                     "codex": {"model": "gpt-5.6-luna", "reasoning_effort": "low", "surface": "agent"},
                     "cache": {"hit": False, "sample_count": 0},
                     "fallback": {"used": False, "error": None},
@@ -82,7 +82,7 @@ class DashboardTests(unittest.TestCase):
                     "decision_id": "decision-b",
                     "task_name": "Cached test run",
                     "task_summary": "3 words; type=implement; risk=low",
-                    "notdiamond": {"proxy_model": "claude-sonnet-4.6", "session_id": None, "request_ms": 80},
+                    "notdiamond": {"proxy_model": "gpt-5.6-terra", "session_id": None, "request_ms": 80},
                     "codex": {"model": "gpt-5.6-terra", "reasoning_effort": "medium", "surface": "agent"},
                     "cache": {"hit": True, "sample_count": 5},
                     "fallback": {"used": True, "error": "timeout"},
@@ -652,20 +652,20 @@ class HookAndLogTests(unittest.TestCase):
             context = MagicMock()
             context.cert_store_stats.return_value = {"x509_ca": roots}
             response = MagicMock()
-            response.__enter__.return_value.read.return_value = b'{"providers":[{"model":"claude-sonnet-4.6"}]}'
-            with self.subTest(platform=platform, roots=roots, overrides=overrides), patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test", **overrides}, clear=True), patch("codex_model_router.router.sys.platform", platform), patch("codex_model_router.router.ssl.create_default_context", return_value=context), patch("codex_model_router.router.Path.is_file", return_value=True), patch("codex_model_router.router.urllib.request.urlopen", return_value=response) as request:
+            response.__enter__.return_value.read.return_value = b'{"providers":[{"model":"gpt-5.6-terra"}]}'
+            with self.subTest(platform=platform, roots=roots, overrides=overrides), patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test", **overrides}, clear=True), patch("codex_model_router.router.sys.platform", platform), patch("codex_model_router.router.ssl.create_default_context", return_value=context), patch("codex_model_router.router.Path.is_file", return_value=True), patch("codex_model_router.router._notdiamond_urlopen", return_value=response) as request:
                 classify_with_notdiamond("Compute 2+2", catalog(), "agent")
                 self.assertEqual(context.load_verify_locations.called, expected)
                 self.assertIs(request.call_args.kwargs["context"], context)
                 if expected:
                     context.load_verify_locations.assert_called_once_with(cafile="/etc/ssl/cert.pem")
 
-    def test_notdiamond_maps_four_claude_capability_proxies(self):
+    def test_notdiamond_preserves_direct_gpt_and_maps_only_frontier(self):
         from unittest.mock import Mock
         proxies = {
-            "claude-haiku-4-5": "gpt-5.6-luna",
-            "claude-sonnet-4.6": "gpt-5.6-terra",
-            "claude-opus-4.7": "gpt-5.6-sol",
+            "gpt-5.6-luna": "gpt-5.6-luna",
+            "gpt-5.6-terra": "gpt-5.6-terra",
+            "gpt-5.6-sol": "gpt-5.6-sol",
             "claude-sonnet-5": "gpt-6-astra",
         }
         for proxy, expected in proxies.items():
@@ -676,7 +676,7 @@ class HookAndLogTests(unittest.TestCase):
                 "providers": [{"provider": "openai", "model": proxy}],
                 "session_id": "session-1",
             }).encode("utf-8")
-            with self.subTest(proxy=proxy), patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test-key"}), patch("codex_model_router.router.urllib.request.urlopen", return_value=response):
+            with self.subTest(proxy=proxy), patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test-key"}), patch("codex_model_router.router._notdiamond_urlopen", return_value=response):
                 selected = classify_with_notdiamond("Implement this task", catalog(), "agent")
             self.assertEqual(selected.model, expected)
             self.assertEqual(selected.nd_proxy_model, proxy)
@@ -690,7 +690,7 @@ class HookAndLogTests(unittest.TestCase):
                 effort="high",
                 task_type="review",
                 source="notdiamond",
-                nd_proxy_model="claude-opus-4.7",
+                nd_proxy_model="gpt-5.6-sol",
             ),
             task,
             catalog(),
@@ -706,7 +706,7 @@ class HookAndLogTests(unittest.TestCase):
                 effort="high",
                 task_type="debug",
                 source="notdiamond",
-                nd_proxy_model="claude-opus-4.7",
+                nd_proxy_model="gpt-5.6-sol",
             ),
             task,
             catalog(),
@@ -714,14 +714,9 @@ class HookAndLogTests(unittest.TestCase):
         )
         self.assertEqual((decision.model, decision.effort), ("gpt-5.6-sol", "high"))
 
-    def test_fable_proxy_maps_to_astra_when_notdiamond_supports_it(self):
-        selected = _proxy_to_choice(
-            "claude-fable-5-1",
-            "Analyze a difficult architecture problem",
-            catalog(),
-            12,
-            "session-fable",
-        )
+    def test_configured_frontier_maps_to_astra(self):
+        with patch.dict(os.environ, {"NOTDIAMOND_FRONTIER_PROXY": "claude-fable-5-1"}):
+            selected = _proxy_to_choice("claude-fable-5-1", "Analyze architecture", catalog(), 12, "test")
         self.assertEqual((selected.model, selected.effort), ("gpt-6-astra", "high"))
 
     def test_notdiamond_failure_falls_back_to_terra_medium(self):
@@ -738,7 +733,7 @@ class HookAndLogTests(unittest.TestCase):
             effort="medium",
             task_type="answer",
             source="notdiamond",
-            nd_proxy_model="claude-sonnet-4.6",
+            nd_proxy_model="gpt-5.6-terra",
         )
         live_decision = apply_policy(live_choice, task, catalog(), surface="agent")
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -765,7 +760,7 @@ class HookAndLogTests(unittest.TestCase):
                 effort="medium",
                 task_type="answer",
                 source="notdiamond",
-                nd_proxy_model="claude-sonnet-4.6",
+                nd_proxy_model="gpt-5.6-terra",
             ),
             task,
             catalog(),
@@ -1086,6 +1081,99 @@ class CliSpawnRouteTests(unittest.TestCase):
             (other_surface.model, other_surface.effort),
             (agent_decision.model, agent_decision.effort),
         )
+
+
+class DirectDNSTests(unittest.TestCase):
+    def test_direct_connection_preserves_tls_hostname_and_context(self):
+        import ssl
+        import urllib.request
+        from unittest.mock import Mock
+        from codex_model_router.router import _notdiamond_urlopen
+        context = ssl.create_default_context()
+        sock = Mock()
+        response = Mock(code=200)
+        def open_connection(handler, connection_class, request, **kwargs):
+            self.assertEqual(request.host, "api.notdiamond.ai")
+            self.assertIs(kwargs["context"], context)
+            connection = connection_class(request.host, timeout=request.timeout, **kwargs)
+            connection.connect()
+            return response
+        request = urllib.request.Request("https://api.notdiamond.ai/v2/modelRouter/modelSelect", data=b'{}')
+        with patch("codex_model_router.router.sys.platform", "darwin"), patch("codex_model_router.router.urllib.request.getproxies", return_value={}), patch("codex_model_router.router.subprocess.run", return_value=Mock(stdout="alias.example.\n216.24.57.15\n")) as dig, patch("codex_model_router.router.socket.create_connection", return_value=sock) as connect, patch.object(context, "wrap_socket", return_value=sock) as tls, patch("urllib.request.HTTPSHandler.do_open", autospec=True, side_effect=open_connection):
+            self.assertIs(_notdiamond_urlopen(request, 8, context), response)
+        self.assertEqual(connect.call_args.args[0], ("216.24.57.15", 443))
+        self.assertEqual(tls.call_args.kwargs["server_hostname"], "api.notdiamond.ai")
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertLessEqual(dig.call_args.kwargs["timeout"], 2)
+
+    def test_empty_dns_fails_without_system_resolution(self):
+        import ssl
+        import urllib.request
+        from unittest.mock import Mock
+        from codex_model_router.router import _notdiamond_urlopen
+        request = urllib.request.Request("https://api.notdiamond.ai/v2/modelRouter/modelSelect")
+        with patch("codex_model_router.router.sys.platform", "darwin"), patch("codex_model_router.router.urllib.request.getproxies", return_value={}), patch("codex_model_router.router.subprocess.run", return_value=Mock(stdout="alias.example.\n")), patch("codex_model_router.router.socket.getaddrinfo") as dns:
+            with self.assertRaisesRegex(OSError, "no IPv4"):
+                _notdiamond_urlopen(request, 8, ssl.create_default_context())
+            dns.assert_not_called()
+
+    def test_proxy_custom_endpoint_and_other_platform_keep_original_transport(self):
+        import ssl
+        import urllib.request
+        from unittest.mock import Mock
+        from codex_model_router.router import _notdiamond_urlopen
+        for platform, url, proxies in [("linux", "https://api.notdiamond.ai/", {}), ("darwin", "https://custom.example/", {}), ("darwin", "https://api.notdiamond.ai/", {"https": "http://127.0.0.1:7890"})]:
+            with self.subTest(platform=platform, url=url, proxies=proxies), patch("codex_model_router.router.sys.platform", platform), patch("codex_model_router.router.urllib.request.getproxies", return_value=proxies), patch("codex_model_router.router.urllib.request.urlopen", return_value=Mock()) as original, patch("codex_model_router.router.subprocess.run") as dig:
+                request = urllib.request.Request(url)
+                context = ssl.create_default_context()
+                _notdiamond_urlopen(request, 8, context)
+                original.assert_called_once_with(request, timeout=8, context=context)
+                dig.assert_not_called()
+
+    def test_dns_timeout_uses_existing_route_fallback(self):
+        import subprocess
+        with patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test-key"}), patch("codex_model_router.router.sys.platform", "darwin"), patch("codex_model_router.router.urllib.request.getproxies", return_value={}), patch("codex_model_router.router.subprocess.run", side_effect=subprocess.TimeoutExpired("dig", 2)):
+            decision = route_task("Compute 2+2", catalog=catalog(), use_cache=False, use_feedback=False)
+        self.assertEqual(decision.source, "notdiamond-fallback")
+        self.assertEqual(decision.model, "gpt-5.6-terra")
+
+
+class DirectModelPolicyTests(unittest.TestCase):
+    def test_candidates_are_direct_gpt_plus_one_frontier(self):
+        from codex_model_router.router import _proxy_candidates
+        with patch.dict(os.environ, {"NOTDIAMOND_FRONTIER_PROXY": "claude-sonnet-5"}):
+            providers = _proxy_candidates()
+        self.assertEqual(providers, [
+            {"provider": "openai", "model": "gpt-5.6-luna"},
+            {"provider": "openai", "model": "gpt-5.6-terra"},
+            {"provider": "openai", "model": "gpt-5.6-sol"},
+            {"provider": "anthropic", "model": "claude-sonnet-5"},
+        ])
+
+    def test_complete_chinese_tasks_do_not_trigger_ambiguous_floor(self):
+        for task in ("只返回2加2的结果，不要解释。", "只读查看package.json，列出scripts中的构建命令，不修改任何文件。", "只读核对这段代码的参数与接口契约，返回依据。"):
+            with self.subTest(task=task):
+                result = apply_policy(choice(), task, catalog(), "agent")
+                self.assertEqual((result.model, result.effort), ("gpt-5.6-luna", "low"))
+                self.assertFalse(result.overrides)
+
+    def test_vague_chinese_and_english_still_use_safety_floor(self):
+        for task in ("继续", "改一下", "重试！", "continue", "it"):
+            with self.subTest(task=task):
+                result = apply_policy(choice(), task, catalog(), "agent")
+                self.assertEqual(result.model, "gpt-5.6-sol")
+
+    def test_astra_is_never_downgraded_by_sol_safety_floor(self):
+        for task, flags in [("Deploy to production", {"public_deployment": True}), ("继续", {})]:
+            with self.subTest(task=task):
+                result = apply_policy(choice(model="gpt-6-astra", effort="high", safety=flags), task, catalog(), "agent")
+                self.assertEqual((result.model, result.effort), ("gpt-6-astra", "high"))
+
+    def test_old_claude_proxies_are_not_accepted_as_direct_gpt(self):
+        for model in ("claude-opus-4.7", "claude-haiku-4-5", "claude-sonnet-4.6"):
+            with self.subTest(model=model), self.assertRaises(ValueError):
+                _proxy_to_choice(model, "List files", catalog(), 1, None)
 
 
 if __name__ == "__main__":

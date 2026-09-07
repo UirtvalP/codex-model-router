@@ -1,6 +1,6 @@
 """A small, local-first router for Codex model and reasoning choices.
 
-Not Diamond only selects a capability proxy; Codex executes the real task.
+Not Diamond selects GPT models directly; only Astra uses a capability proxy.
 The router applies deterministic safety floors and preserves the task's
 approval or sandbox policy unless the caller explicitly passes a sandbox value.
 """
@@ -8,10 +8,13 @@ approval or sandbox policy unless the caller explicitly passes a sandbox value.
 from __future__ import annotations
 
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import sys
 import subprocess
@@ -27,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-ROUTER_VERSION = "0.6.1"
+ROUTER_VERSION = "0.6.2"
 PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
 NOTDIAMOND_DEFAULT_URL = "https://api.notdiamond.ai/v2/modelRouter/modelSelect"
 NOTDIAMOND_DEFAULT_TIMEOUT_SECONDS = 8.0
@@ -37,9 +40,9 @@ ROUTE_CACHE_DEFAULT_SIMILARITY = 0.78
 ROUTE_CACHE_DEFAULT_MAJORITY = 0.80
 ROUTE_CACHE_DEFAULT_MAX_AGE_DAYS = 7.0
 NOTDIAMOND_PROVIDERS = (
-    {"provider": "anthropic", "model": "claude-haiku-4-5"},
-    {"provider": "anthropic", "model": "claude-sonnet-4.6"},
-    {"provider": "anthropic", "model": "claude-opus-4.7"},
+    {"provider": "openai", "model": "gpt-5.6-luna"},
+    {"provider": "openai", "model": "gpt-5.6-terra"},
+    {"provider": "openai", "model": "gpt-5.6-sol"},
 )
 NOTDIAMOND_DEFAULT_FRONTIER_PROXY = "claude-sonnet-5"
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max", "ultra")
@@ -704,18 +707,14 @@ def _selected_proxy(result: Mapping[str, Any]) -> Tuple[str, Optional[str]]:
 
 def _proxy_to_choice(proxy_model: str, task: str, catalog: ModelCatalog, elapsed_ms: int,
                      session_id: Optional[str]) -> RouteChoice:
-    normalized = proxy_model.lower()
-    if "fable" in normalized or re.search(r"sonnet[-.]?5(?:\b|[-.])", normalized):
-        family, effort = "astra", "high"
-    elif normalized.endswith("luna") or "haiku" in normalized:
-        family, effort = "luna", "low"
-    elif normalized.endswith("terra") or "sonnet" in normalized:
-        family, effort = "terra", "medium"
-    elif normalized.endswith("sol") or "opus" in normalized:
-        family, effort = "sol", "high"
+    direct_efforts = {"gpt-5.6-luna": "low", "gpt-5.6-terra": "medium", "gpt-5.6-sol": "high"}
+    frontier = os.environ.get("NOTDIAMOND_FRONTIER_PROXY", NOTDIAMOND_DEFAULT_FRONTIER_PROXY).strip()
+    if proxy_model in direct_efforts and proxy_model in catalog.models:
+        model, effort = proxy_model, direct_efforts[proxy_model]
+    elif frontier and proxy_model == frontier:
+        model, effort = catalog.preferred("astra"), "high"
     else:
         raise ValueError("Unsupported Not Diamond route model: {0}".format(proxy_model))
-    model = catalog.preferred(family)
     return RouteChoice(
         model=model,
         effort=effort,
@@ -731,6 +730,60 @@ def _proxy_to_choice(proxy_model: str, task: str, catalog: ModelCatalog, elapsed
         nd_proxy_model=proxy_model,
         nd_session_id=session_id,
     )
+
+
+def _notdiamond_urlopen(request, timeout, context):
+    # 仅 macOS 上的官方直连请求绕过系统解析；代理及自定义端点沿用原路径。
+    hostname = "api.notdiamond.ai"
+    if (sys.platform != "darwin" or request.type != "https"
+            or request.host != hostname or urllib.request.getproxies().get("https")):
+        return urllib.request.urlopen(request, timeout=timeout, context=context)
+    started = time.perf_counter()
+    result = subprocess.run(
+        ["/usr/bin/dig", "+short", "+time=1", "+tries=1", hostname, "A"],
+        capture_output=True, text=True, check=True, timeout=min(timeout, 2.0),
+    )
+    addresses = []
+    for line in result.stdout.splitlines():
+        try:
+            addresses.append(str(ipaddress.IPv4Address(line.strip())))
+        except ipaddress.AddressValueError:
+            continue
+    if not addresses:
+        raise OSError("Not Diamond DNS lookup returned no IPv4 addresses")
+    remaining = timeout - (time.perf_counter() - started)
+    if remaining <= 0:
+        raise TimeoutError("Not Diamond DNS lookup exhausted request timeout")
+
+    class DirectHTTPSConnection(http.client.HTTPSConnection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            original_connect = self._create_connection
+
+            def connect_address(address, timeout, source_address=None):
+                if address[0] != hostname:
+                    return original_connect(address, timeout, source_address)
+                # 只替换 TCP 目的地址；HTTPSConnection 仍用原域名进行 SNI 与证书校验。
+                deadline = time.monotonic() + timeout
+                for ip in addresses:
+                    budget = deadline - time.monotonic()
+                    if budget <= 0:
+                        raise TimeoutError("Not Diamond connection timed out")
+                    try:
+                        return socket.create_connection((ip, address[1]), budget, source_address)
+                    except OSError:
+                        if ip == addresses[-1]:
+                            raise
+                raise OSError("Not Diamond connection failed")
+
+            self._create_connection = connect_address
+
+    class DirectHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(DirectHTTPSConnection, req, context=context)
+
+    opener = urllib.request.build_opener(DirectHTTPSHandler(context=context))
+    return opener.open(request, timeout=remaining)
 
 
 def classify_with_notdiamond(
@@ -777,7 +830,7 @@ def classify_with_notdiamond(
             and Path("/etc/ssl/cert.pem").is_file()
         ):
             context.load_verify_locations(cafile="/etc/ssl/cert.pem")
-        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        with _notdiamond_urlopen(request, timeout=timeout, context=context) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         raise RuntimeError("Not Diamond modelSelect failed: {0}".format(exc)) from exc
@@ -853,7 +906,7 @@ def apply_policy(
     has_high_consequence = any(safety.values()) or risk == "high"
 
     if has_high_consequence:
-        sol = catalog.preferred("sol")
+        sol = model if _model_family(model) == "astra" else catalog.preferred("sol")
         if model != sol:
             overrides.append("high-consequence task upgraded to Sol")
         model = sol
@@ -869,9 +922,10 @@ def apply_policy(
         effort = _effort_at_least(catalog, model, effort, "medium")
         overrides.append("agentic code task raised to Terra/medium")
 
-    short_ambiguous = len(task.split()) < 2 or _matches_any(
+    short_ambiguous = len(re.findall(r"[\u3400-\u9fff]|[^\W_]+", task)) < 2 or _matches_any(
         task,
         (
+            r"^\s*(?:继续|重试|再来|照旧|修一下|改一下|处理一下)[。！!]?\s*$",
             r"^\s*(?:do\s+)?it(?:\s+all)?[.!]?\s*$",
             r"^\s*(?:continue|finish|retry|same|again|do it all)[.!]?\s*$",
             r"^\s*(?:fix|change|use)\s+(?:it|that|this)[.!]?\s*$",
@@ -879,7 +933,7 @@ def apply_policy(
     )
     ambiguous = choice.confidence < 0.55 or short_ambiguous
     if ambiguous:
-        sol = catalog.preferred("sol")
+        sol = model if _model_family(model) == "astra" else catalog.preferred("sol")
         if model != sol or EFFORT_ORDER.index(effort) < EFFORT_ORDER.index("medium"):
             overrides.append("ambiguous or low-confidence task raised to Sol/medium")
         model = sol
