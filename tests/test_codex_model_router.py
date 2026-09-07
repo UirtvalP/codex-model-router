@@ -632,6 +632,34 @@ class HookAndLogTests(unittest.TestCase):
         self.assertEqual(updated["model"], decision.model)
         self.assertEqual(updated["reasoning_effort"], decision.effort)
 
+    def test_desktop_spawn_names_match_and_route(self):
+        import re
+        from codex_model_router.user_hook import build_user_hook_group
+        matcher = build_user_hook_group()["matcher"]
+        for name in ("collaborationspawn_agent", "collaboration.spawn_agent"):
+            with self.subTest(name=name), patch("codex_model_router.router.discover_catalog", return_value=catalog()):
+                self.assertIsNotNone(re.fullmatch(matcher, name))
+                result = run_hook({"tool_name": name, "tool_input": {"message": "Compute 2+2"}}, heuristic_only=True, no_log=True)
+                self.assertIn("model", result["hookSpecificOutput"]["updatedInput"])
+        self.assertIsNone(re.fullmatch(matcher, "exec_command"))
+
+    def test_macos_empty_ca_uses_system_bundle_and_respects_overrides(self):
+        from unittest.mock import MagicMock
+        cases = [("darwin", 0, {}, True), ("darwin", 2, {}, False),
+                 ("linux", 0, {}, False), ("darwin", 0, {"SSL_CERT_FILE": "/custom.pem"}, False),
+                 ("darwin", 0, {"SSL_CERT_DIR": "/custom"}, False)]
+        for platform, roots, overrides, expected in cases:
+            context = MagicMock()
+            context.cert_store_stats.return_value = {"x509_ca": roots}
+            response = MagicMock()
+            response.__enter__.return_value.read.return_value = b'{"providers":[{"model":"claude-sonnet-4.6"}]}'
+            with self.subTest(platform=platform, roots=roots, overrides=overrides), patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test", **overrides}, clear=True), patch("codex_model_router.router.sys.platform", platform), patch("codex_model_router.router.ssl.create_default_context", return_value=context), patch("codex_model_router.router.Path.is_file", return_value=True), patch("codex_model_router.router.urllib.request.urlopen", return_value=response) as request:
+                classify_with_notdiamond("Compute 2+2", catalog(), "agent")
+                self.assertEqual(context.load_verify_locations.called, expected)
+                self.assertIs(request.call_args.kwargs["context"], context)
+                if expected:
+                    context.load_verify_locations.assert_called_once_with(cafile="/etc/ssl/cert.pem")
+
     def test_notdiamond_maps_four_claude_capability_proxies(self):
         from unittest.mock import Mock
         proxies = {

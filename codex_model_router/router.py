@@ -12,6 +12,8 @@ import json
 import os
 import re
 import shutil
+import ssl
+import sys
 import subprocess
 import tempfile
 import time
@@ -765,7 +767,17 @@ def classify_with_notdiamond(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        context = ssl.create_default_context()
+        # macOS 的部分 Python 安装没有默认 CA，改用系统证书并保留完整 TLS 校验。
+        if (
+            sys.platform == "darwin"
+            and not os.environ.get("SSL_CERT_FILE")
+            and not os.environ.get("SSL_CERT_DIR")
+            and context.cert_store_stats()["x509_ca"] == 0
+            and Path("/etc/ssl/cert.pem").is_file()
+        ):
+            context.load_verify_locations(cafile="/etc/ssl/cert.pem")
+        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         raise RuntimeError("Not Diamond modelSelect failed: {0}".format(exc)) from exc
@@ -1729,6 +1741,8 @@ def run_hook(
         "spawn_agent",
         "multi_agent_v1__spawn_agent",
         "functions.collaboration.spawn_agent",
+        "collaboration.spawn_agent",
+        "collaborationspawn_agent",
     ):
         return None
     tool_input, preserve_model = _prepare_hook_input(payload)
