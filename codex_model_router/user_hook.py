@@ -81,7 +81,8 @@ def build_user_hook_group(
     return {
         "matcher": (
             "^(Agent|spawn_agent|multi_agent_v1__spawn_agent|"
-            "functions\\.collaboration\\.spawn_agent)$"
+            "functions\\.collaboration\\.spawn_agent|collaboration\\.spawn_agent|"
+            "collaborationspawn_agent)$"
         ),
         "hooks": [
             {

@@ -24,7 +24,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m unittest discover -s tests -p "test_*.py" -v
       - run: python -m pip wheel --no-deps --wheel-dir dist .
-      - run: python -m pip install --force-reinstall --no-deps dist/codex_model_router-0.1.0-py3-none-any.whl
+      - run: >-
+          python -c "import pathlib, subprocess, sys; wheels = list(pathlib.Path('dist').glob('codex_model_router-*.whl')); assert len(wheels) == 1, wheels; subprocess.run([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', str(wheels[0])], check=True)"
       - run: codex-model-router --help
         working-directory: ${{ runner.temp }}
       - run: python -I -m codex_model_router --help
