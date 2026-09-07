@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .router import (
+    CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS,
     append_decision_log,
     append_feedback,
     default_log_path,
@@ -26,8 +27,8 @@ from .user_hook import install_user_hook
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Use Not Diamond route-only modelSelect plus deterministic policy "
-            "to choose the Codex model and reasoning effort."
+            "Use an isolated Codex evaluator plus deterministic policy to choose "
+            "the Codex model and reasoning effort."
         )
     )
     parser.add_argument("task", nargs="*", help="Task text; stdin is used when omitted")
@@ -59,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--heuristic-only",
         action="store_true",
-        help="Skip the Luna call and use the offline local policy",
+        help="Skip the Codex evaluator and use the offline local policy",
     )
     parser.add_argument(
         "--hook",
@@ -90,8 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--classifier-timeout",
         type=float,
-        default=20.0,
-        help="Seconds before falling back to the local heuristic",
+        default=CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS,
+        help="Seconds before using the Terra/medium fallback",
     )
     parser.add_argument(
         "--no-log",

@@ -3,13 +3,13 @@
 An experimental, local-first router that chooses a Codex model, reasoning
 effort, and safe delegation policy before a task runs.
 
-It uses Not Diamond's route-only `/v2/modelRouter/modelSelect` endpoint to
-choose a capability tier, then uses the selected Codex subscription model for
-the real work. Not Diamond never executes the task. If the route request fails,
-the hook falls back to Terra/medium.
+By default, a fixed Terra/low Codex CLI evaluator with Fast enabled chooses directly among
+Luna, Terra, Sol, and Astra, then the selected Codex subscription model runs
+the task. The evaluator uses the existing ChatGPT login. If evaluation fails,
+the hook falls back to Terra/medium and records the failure.
 
 ```text
-prompt -> Not Diamond modelSelect -> capability mapping -> Codex subscription
+prompt -> Codex evaluator (Terra/low) -> selected Codex model + reasoning effort
 ```
 
 This is an MVP, not an official OpenAI project.
@@ -21,18 +21,18 @@ This is an MVP, not an official OpenAI project.
 | Luna | Classification, formatting, bounded answers, tiny deterministic work |
 | Terra | Normal implementation, debugging, review, and moderate research |
 | Sol | Ambiguous, cross-cutting, high-consequence, or exceptionally hard work |
-| Astra | Frontier proxy for the hardest tasks |
+| Astra | Most demanding reasoning and complex tasks |
 
-Safety-sensitive work involving external writes, deletion, money, credentials,
-security, legal or medical decisions, persisted data, or public deployment is
-forced to Sol/high or stronger and single-agent execution.
+The evaluator chooses the model and reasoning effort. Local validation checks
+availability and supported effort without task-content-based model upgrades.
+Safety metadata can restrict delegation; it does not force a stronger model.
 
 ## Requirements
 
 - Python 3.9 or newer.
 - Codex CLI 0.145.0 or newer, logged in with ChatGPT.
 - Account access to the Luna, Terra, Sol, and Astra model families.
-- A Not Diamond API key in `NOTDIAMOND_API_KEY`.
+- The evaluator uses the existing ChatGPT login; no separate routing API key is needed.
 
 The CLI, package, and hook surfaces were validated against `codex-cli 0.145.0`.
 Model availability is still account- and release-dependent.
@@ -52,21 +52,15 @@ Windows PowerShell:
 git clone https://github.com/UirtvalP/codex-model-router.git
 Set-Location codex-model-router
 python -m pip install .
-$env:NOTDIAMOND_API_KEY = "your-key"
 codex login status
 ```
 
 macOS/Linux:
 
 ```bash
-export NOTDIAMOND_API_KEY="your-key"
 python3 -m pip install .
 codex login status
 ```
-
-Use a persistent user environment variable only if desired (`setx
-NOTDIAMOND_API_KEY "your-key"` on Windows, or your shell profile on
-macOS/Linux). Never put the key in this repository.
 
 Inspect a decision without launching the real task:
 
@@ -161,15 +155,10 @@ default_subagent_model = "gpt-5.6-terra"
 default_subagent_reasoning_effort = "medium"
 ```
 
-The capability proxies are Haiku 4.5 → Luna, Sonnet 4.6 → Terra, Opus 4.7 →
-Sol, and the highest Claude proxy currently exposed by Not Diamond → Astra.
-At present that frontier proxy is `claude-sonnet-5`. The router also recognizes
-`claude-fable-5` and `claude-fable-5-1` as Astra proxies; when Not Diamond adds
-one to your model catalog, select it with
-`NOTDIAMOND_FRONTIER_PROXY=claude-fable-5-1`. Opus always maps to Sol and is
-never promoted to Astra by local keywords.
-`NOTDIAMOND_COST_QUALITY_TRADEOFF` defaults to `1` and accepts `0`–`10`;
-`NOTDIAMOND_TIMEOUT_SECONDS` defaults to `8`.
+The online evaluator is Codex only. It requests `service_tier="fast"` with
+`fast_mode` enabled and keeps Terra/low fixed. `--heuristic-only` remains
+available for explicit offline routing. No external router, proxy-model mapping,
+or external-router cache is used.
 
 ## Feedback
 
@@ -180,56 +169,31 @@ result:
 python -I -m codex_model_router --feedback DECISION_ID --rating good
 ```
 
-Ratings are `good`, `underpowered`, `overkill`, and `failed`. Exact-task
-feedback is applied immediately; similar structured tasks require at least
-three labels and a two-thirds majority. Safety policy is reapplied after every
-learned adjustment.
+Ratings are `good`, `underpowered`, `overkill`, and `failed`. Feedback-based
+route adjustments apply only in explicit heuristic-only mode. Live evaluator
+decisions are not silently upgraded using local feedback.
 
 ## Privacy And Cost
 
-The default route sends up to 12,000 characters to Not Diamond's route-only
-endpoint with `hash_content=true`, then sends the unchanged original prompt to
-the selected Codex model. The Not Diamond response contains a `session_id` for
-diagnostics and feedback. Use `--heuristic-only` to avoid the network route.
+The default route sends a bounded task excerpt to a separate Codex evaluation
+turn using the existing ChatGPT login. This consumes subscription usage and
+adds model-call latency before the worker starts. No separate routing service receives the task.
 
-The classifier runs ephemerally in an empty, read-only directory with the shell
-tool, multi-agent delegation, web search, project rules, and session persistence
-disabled. API key environment variables are removed so the saved ChatGPT login
-is used.
+The evaluator runs ephemerally in an empty, read-only directory. Hooks,
+delegation, shell access, web search, plugins, and project rules are disabled.
+API-key environment variables are removed. The evaluator is instructed only
+to classify the task, and its response is validated before use.
 
-Local decision logs do not contain raw prompts, classifier prose, or checkout
-paths. They contain a non-sensitive task summary, hashes, structured task
-features, the Not Diamond proxy and session ID, the mapped route, fallback
-errors, timings, and exit status. The default path is
+Decision logs contain a controlled evaluation summary, selected route, evaluator
+metadata, fallback errors, timings, task hashes, and structured task features.
+Full prompts are not logged. The default path is
 `%LOCALAPPDATA%\CodexModelRouter\decisions.jsonl` on Windows and
 `~/.codex/router/decisions.jsonl` elsewhere.
 
-Each JSONL record also includes a top-level `display` line plus explicit
-`notdiamond`, `codex`, and `fallback` objects, so the selected proxy, actual
-Codex model, reasoning effort, session ID, and failure reason are visible
-without decoding the nested policy record.
-
-## Similar-task route cache
-
-Repeated short tasks can reuse a stable local routing decision instead of
-calling Not Diamond every time. By default, a cache hit requires at least five
-successful live Not Diamond routes from the last seven days, task similarity of
-at least `0.78`, and an `0.80` majority for the same proxy/model/effort route.
-Fallback decisions and high-consequence tasks are never cached, and cached
-decisions are not allowed to train themselves.
-
-Configuration environment variables:
-
-```text
-CODEX_ROUTER_CACHE_ENABLED=1
-CODEX_ROUTER_CACHE_MIN_SAMPLES=5
-CODEX_ROUTER_CACHE_SIMILARITY=0.78
-CODEX_ROUTER_CACHE_MAJORITY=0.80
-CODEX_ROUTER_CACHE_MAX_AGE_DAYS=7
-```
-
-The log `display` field reports `source notdiamond`, `source similarity-cache`,
-or `source notdiamond-fallback`, plus cache hit/miss and sample count.
+New records expose an `evaluator` object alongside `codex` and `fallback`.
+Historical `notdiamond` records remain readable. A selected model in the route
+log is the requested execution model; it is not independent evidence of the
+upstream model's identity.
 
 ## Local routing dashboard
 
@@ -244,8 +208,9 @@ python3 -m codex_model_router.dashboard
 ```
 
 The dashboard listens only on `127.0.0.1:8765`. It shows total and 24-hour
-routing volume, Codex model distribution, cache and fallback rates, Not Diamond
-latency, and the latest proxy-to-Codex mapping for each task. It does not change
+routing volume, separate model distributions for each source, fallback rates,
+selection latency, and evaluator-to-execution model choices. Historical cache
+statistics remain readable for old records. It does not change
 routing decisions or upload log data. Use `--no-browser`, `--port`, or
 `--log-path` to customize startup.
 

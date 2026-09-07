@@ -1,27 +1,21 @@
 """A small, local-first router for Codex model and reasoning choices.
 
-Not Diamond selects GPT models directly; only Astra uses a capability proxy.
-The router applies deterministic safety floors and preserves the task's
+An isolated Codex evaluator selects the route. The router preserves the task's
 approval or sandbox policy unless the caller explicitly passes a sandbox value.
 """
 
 from __future__ import annotations
 
 import hashlib
-import http.client
-import ipaddress
 import json
+import math
 import os
 import re
+import signal
 import shutil
-import socket
-import ssl
-import sys
 import subprocess
 import tempfile
 import time
-import urllib.error
-import urllib.request
 import uuid
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
@@ -30,21 +24,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-ROUTER_VERSION = "0.6.2"
+ROUTER_VERSION = "0.8.0"
 PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
-NOTDIAMOND_DEFAULT_URL = "https://api.notdiamond.ai/v2/modelRouter/modelSelect"
-NOTDIAMOND_DEFAULT_TIMEOUT_SECONDS = 8.0
-NOTDIAMOND_DEFAULT_COST_QUALITY_TRADEOFF = 1
-ROUTE_CACHE_DEFAULT_MIN_SAMPLES = 5
-ROUTE_CACHE_DEFAULT_SIMILARITY = 0.78
-ROUTE_CACHE_DEFAULT_MAJORITY = 0.80
-ROUTE_CACHE_DEFAULT_MAX_AGE_DAYS = 7.0
-NOTDIAMOND_PROVIDERS = (
-    {"provider": "openai", "model": "gpt-5.6-luna"},
-    {"provider": "openai", "model": "gpt-5.6-terra"},
-    {"provider": "openai", "model": "gpt-5.6-sol"},
-)
-NOTDIAMOND_DEFAULT_FRONTIER_PROXY = "claude-sonnet-5"
+CODEX_EVALUATOR_MODEL = "gpt-5.6-terra"
+CODEX_EVALUATOR_EFFORT = "low"
+CODEX_EVALUATOR_GUARD = "CODEX_MODEL_ROUTER_EVALUATOR"
+CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS = 30.0
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max", "ultra")
 TASK_TYPES = (
     "answer",
@@ -130,12 +115,11 @@ class RouteChoice:
     safety: Dict[str, bool] = field(default_factory=dict)
     source: str = "heuristic"
     classifier_ms: Optional[int] = None
-    nd_proxy_model: Optional[str] = None
-    nd_session_id: Optional[str] = None
-    nd_error: Optional[str] = None
-    cache_hit: bool = False
-    cache_sample_count: int = 0
-    cache_similarity: Optional[float] = None
+    evaluator_model: Optional[str] = None
+    evaluator_reason: Optional[str] = None
+    evaluator_thread_id: Optional[str] = None
+    evaluator_usage: Dict[str, int] = field(default_factory=dict)
+    evaluator_error: Optional[str] = None
 
 
 @dataclass
@@ -157,12 +141,11 @@ class RoutingDecision:
     classifier_ms: Optional[int]
     safety: Dict[str, bool]
     overrides: List[str] = field(default_factory=list)
-    nd_proxy_model: Optional[str] = None
-    nd_session_id: Optional[str] = None
-    nd_error: Optional[str] = None
-    cache_hit: bool = False
-    cache_sample_count: int = 0
-    cache_similarity: Optional[float] = None
+    evaluator_model: Optional[str] = None
+    evaluator_reason: Optional[str] = None
+    evaluator_thread_id: Optional[str] = None
+    evaluator_usage: Dict[str, int] = field(default_factory=dict)
+    evaluator_error: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -550,7 +533,9 @@ def _classifier_prompt(task: str, surface: str, catalog: ModelCatalog) -> str:
         "Model roles:\n"
         "- Luna: quick classification, formatting, bounded answers, tiny deterministic work.\n"
         "- Terra: normal implementation, debugging, reviews, and moderate research.\n"
-        "- Sol: ambiguous, cross-cutting, high-consequence, or exceptionally hard work.\n\n"
+        "- Sol: ambiguous, cross-cutting, high-consequence, or exceptionally hard work.\n"
+        "- Astra: frontier reasoning where several hard constraints interact and weaker "
+        "approaches are unlikely to be reliable.\n\n"
         "Reasoning roles:\n"
         "- low: straightforward; medium: everyday agentic work; high: complex or high stakes.\n"
         "- xhigh/max: unusually difficult single-agent work.\n"
@@ -576,16 +561,18 @@ def classifier_environment(
     """Keep ChatGPT auth while preventing accidental API-key billing."""
 
     original = source if source is not None else os.environ
-    return {
+    environment = {
         key: value
         for key, value in original.items()
         if key.upper() not in SENSITIVE_API_ENV_KEYS
     }
+    environment[CODEX_EVALUATOR_GUARD] = "1"
+    return environment
 
 
 def build_classifier_command(
     codex_executable: str,
-    luna_model: str,
+    evaluator_model: str,
     working_directory: str,
     schema_path: str,
     output_path: str,
@@ -604,12 +591,32 @@ def build_classifier_command(
         "shell_tool",
         "--disable",
         "multi_agent",
+        "--disable",
+        "hooks",
+        "--disable",
+        "apps",
+        "--disable",
+        "plugins",
+        "--disable",
+        "browser_use",
+        "--disable",
+        "computer_use",
+        "--disable",
+        "image_generation",
+        "--disable",
+        "memories",
+        "--disable",
+        "skill_search",
         "-C",
         working_directory,
         "-m",
-        luna_model,
+        evaluator_model,
         "-c",
         'model_reasoning_effort="low"',
+        "--enable",
+        "fast_mode",
+        "-c",
+        'service_tier="fast"',
         "-c",
         'model_verbosity="low"',
         "-c",
@@ -628,215 +635,212 @@ def build_classifier_command(
 
 
 def _choice_from_payload(payload: Mapping[str, Any], classifier_ms: int) -> RouteChoice:
-    safety_payload = payload.get("safety", {})
-    safety = {
-        key: bool(safety_payload.get(key, False))
-        if isinstance(safety_payload, Mapping)
-        else False
-        for key in SAFETY_KEYS
+    required = {
+        "model",
+        "effort",
+        "orchestration",
+        "task_type",
+        "risk",
+        "parallelizable",
+        "confidence",
+        "reason",
+        "safety",
     }
-    confidence = float(payload.get("confidence", 0.0))
+    if set(payload) != required:
+        raise ValueError("Codex evaluator output has missing or unexpected fields")
+    for key in ("model", "effort", "orchestration", "task_type", "risk", "reason"):
+        if not isinstance(payload[key], str):
+            raise TypeError("Codex evaluator field {0} must be a string".format(key))
+    if payload["effort"] not in EFFORT_ORDER:
+        raise ValueError("Codex evaluator returned an invalid effort")
+    if payload["orchestration"] not in ORCHESTRATIONS:
+        raise ValueError("Codex evaluator returned an invalid orchestration")
+    if payload["task_type"] not in TASK_TYPES:
+        raise ValueError("Codex evaluator returned an invalid task type")
+    if payload["risk"] not in RISK_LEVELS:
+        raise ValueError("Codex evaluator returned an invalid risk")
+    if not isinstance(payload["parallelizable"], bool):
+        raise TypeError("Codex evaluator parallelizable field must be boolean")
+    raw_confidence = payload["confidence"]
+    if (
+        not isinstance(raw_confidence, (int, float))
+        or isinstance(raw_confidence, bool)
+        or not math.isfinite(raw_confidence)
+        or not 0 <= raw_confidence <= 1
+    ):
+        raise ValueError("Codex evaluator confidence must be finite and between 0 and 1")
+    safety_payload = payload["safety"]
+    if not isinstance(safety_payload, Mapping) or set(safety_payload) != set(SAFETY_KEYS):
+        raise ValueError("Codex evaluator safety fields do not match the schema")
+    if not all(isinstance(safety_payload[key], bool) for key in SAFETY_KEYS):
+        raise TypeError("Codex evaluator safety fields must be boolean")
+    safety = {key: safety_payload[key] for key in SAFETY_KEYS}
     return RouteChoice(
-        model=str(payload["model"]),
-        effort=str(payload["effort"]),
-        orchestration=str(payload["orchestration"]),
-        task_type=str(payload["task_type"]),
-        risk=str(payload["risk"]),
-        parallelizable=bool(payload["parallelizable"]),
-        confidence=max(0.0, min(1.0, confidence)),
-        reason=str(payload["reason"])[:240],
+        model=payload["model"],
+        effort=payload["effort"],
+        orchestration=payload["orchestration"],
+        task_type=payload["task_type"],
+        risk=payload["risk"],
+        parallelizable=payload["parallelizable"],
+        confidence=float(raw_confidence),
+        reason=payload["reason"][:240],
         safety=safety,
-        source="luna",
+        source="codex-evaluator",
         classifier_ms=classifier_ms,
     )
 
 
-def _notdiamond_settings() -> Tuple[str, float, int]:
-    url = os.environ.get("NOTDIAMOND_API_URL", NOTDIAMOND_DEFAULT_URL)
-    try:
-        timeout = max(0.1, float(os.environ.get(
-            "NOTDIAMOND_TIMEOUT_SECONDS",
-            str(NOTDIAMOND_DEFAULT_TIMEOUT_SECONDS),
-        )))
-    except ValueError:
-        timeout = NOTDIAMOND_DEFAULT_TIMEOUT_SECONDS
-    try:
-        tradeoff = int(os.environ.get(
-            "NOTDIAMOND_COST_QUALITY_TRADEOFF",
-            str(NOTDIAMOND_DEFAULT_COST_QUALITY_TRADEOFF),
-        ))
-    except ValueError:
-        tradeoff = NOTDIAMOND_DEFAULT_COST_QUALITY_TRADEOFF
-    return url, timeout, max(0, min(10, tradeoff))
+def _terminate_classifier_process(process: subprocess.Popen) -> None:
+    """Terminate the evaluator and any descendants after a timeout."""
 
-
-def _proxy_candidates() -> List[Dict[str, str]]:
-    candidates = [dict(item) for item in NOTDIAMOND_PROVIDERS]
-    frontier = os.environ.get(
-        "NOTDIAMOND_FRONTIER_PROXY",
-        NOTDIAMOND_DEFAULT_FRONTIER_PROXY,
-    ).strip()
-    if frontier:
-        candidates.append({"provider": "anthropic", "model": frontier})
-    return candidates
-
-
-def _provider_value(value: Any, key: str) -> Optional[str]:
-    if isinstance(value, Mapping):
-        result = value.get(key)
-    else:
-        result = getattr(value, key, None)
-    return str(result) if result else None
-
-
-def _selected_proxy(result: Mapping[str, Any]) -> Tuple[str, Optional[str]]:
-    provider = result.get("provider")
-    if provider is None:
-        providers = result.get("providers")
-        if isinstance(providers, list) and providers:
-            provider = providers[0]
-    model = _provider_value(provider, "model")
-    if model is None:
-        model = _provider_value(result, "model")
-    if model is None and isinstance(result.get("selected_model"), str):
-        model = result["selected_model"]
-    if model is None:
-        raise ValueError("Not Diamond response did not include a selected model")
-    return model, _provider_value(result, "session_id")
-
-
-def _proxy_to_choice(proxy_model: str, task: str, catalog: ModelCatalog, elapsed_ms: int,
-                     session_id: Optional[str]) -> RouteChoice:
-    direct_efforts = {"gpt-5.6-luna": "low", "gpt-5.6-terra": "medium", "gpt-5.6-sol": "high"}
-    frontier = os.environ.get("NOTDIAMOND_FRONTIER_PROXY", NOTDIAMOND_DEFAULT_FRONTIER_PROXY).strip()
-    if proxy_model in direct_efforts and proxy_model in catalog.models:
-        model, effort = proxy_model, direct_efforts[proxy_model]
-    elif frontier and proxy_model == frontier:
-        model, effort = catalog.preferred("astra"), "high"
-    else:
-        raise ValueError("Unsupported Not Diamond route model: {0}".format(proxy_model))
-    return RouteChoice(
-        model=model,
-        effort=effort,
-        orchestration="single",
-        task_type=_task_type(task),
-        risk="low",
-        parallelizable=False,
-        confidence=1.0,
-        reason="Not Diamond route-only modelSelect selected {0}.".format(proxy_model),
-        safety=_empty_safety(),
-        source="notdiamond",
-        classifier_ms=elapsed_ms,
-        nd_proxy_model=proxy_model,
-        nd_session_id=session_id,
-    )
-
-
-def _notdiamond_urlopen(request, timeout, context):
-    # 仅 macOS 上的官方直连请求绕过系统解析；代理及自定义端点沿用原路径。
-    hostname = "api.notdiamond.ai"
-    if (sys.platform != "darwin" or request.type != "https"
-            or request.host != hostname or urllib.request.getproxies().get("https")):
-        return urllib.request.urlopen(request, timeout=timeout, context=context)
-    started = time.perf_counter()
-    result = subprocess.run(
-        ["/usr/bin/dig", "+short", "+time=1", "+tries=1", hostname, "A"],
-        capture_output=True, text=True, check=True, timeout=min(timeout, 2.0),
-    )
-    addresses = []
-    for line in result.stdout.splitlines():
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
         try:
-            addresses.append(str(ipaddress.IPv4Address(line.strip())))
-        except ipaddress.AddressValueError:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                timeout=5.0,
+                shell=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                pass
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait()
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _evaluator_observability(stdout: str) -> Tuple[Optional[str], Dict[str, int]]:
+    thread_id: Optional[str] = None
+    usage: Dict[str, int] = {}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
             continue
-    if not addresses:
-        raise OSError("Not Diamond DNS lookup returned no IPv4 addresses")
-    remaining = timeout - (time.perf_counter() - started)
-    if remaining <= 0:
-        raise TimeoutError("Not Diamond DNS lookup exhausted request timeout")
-
-    class DirectHTTPSConnection(http.client.HTTPSConnection):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            original_connect = self._create_connection
-
-            def connect_address(address, timeout, source_address=None):
-                if address[0] != hostname:
-                    return original_connect(address, timeout, source_address)
-                # 只替换 TCP 目的地址；HTTPSConnection 仍用原域名进行 SNI 与证书校验。
-                deadline = time.monotonic() + timeout
-                for ip in addresses:
-                    budget = deadline - time.monotonic()
-                    if budget <= 0:
-                        raise TimeoutError("Not Diamond connection timed out")
-                    try:
-                        return socket.create_connection((ip, address[1]), budget, source_address)
-                    except OSError:
-                        if ip == addresses[-1]:
-                            raise
-                raise OSError("Not Diamond connection failed")
-
-            self._create_connection = connect_address
-
-    class DirectHTTPSHandler(urllib.request.HTTPSHandler):
-        def https_open(self, req):
-            return self.do_open(DirectHTTPSConnection, req, context=context)
-
-    opener = urllib.request.build_opener(DirectHTTPSHandler(context=context))
-    return opener.open(request, timeout=remaining)
+        if not isinstance(event, Mapping):
+            continue
+        if event.get("type") == "thread.started" and event.get("thread_id"):
+            thread_id = str(event["thread_id"])
+        if event.get("type") == "turn.completed" and isinstance(event.get("usage"), Mapping):
+            usage = {
+                str(key): int(value)
+                for key, value in event["usage"].items()
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+        if event.get("type") in ("item.started", "item.completed"):
+            item = event.get("item")
+            item_type = item.get("type") if isinstance(item, Mapping) else None
+            if item_type not in (None, "agent_message", "reasoning"):
+                raise RuntimeError(
+                    "Codex evaluator attempted disabled tool item: {0}".format(item_type)
+                )
+    return thread_id, usage
 
 
-def classify_with_notdiamond(
+def classify_with_codex(
     task: str,
     catalog: ModelCatalog,
     surface: str,
-    timeout_seconds: float = 20.0,
+    codex_executable: Optional[str] = None,
+    timeout_seconds: float = CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS,
 ) -> RouteChoice:
-    """Call Not Diamond's route-only modelSelect endpoint; never executes an LLM."""
+    """Classify one task with an isolated, ChatGPT-authenticated Codex process."""
 
-    api_key = os.environ.get("NOTDIAMOND_API_KEY")
-    if not api_key:
-        raise RuntimeError("NOTDIAMOND_API_KEY is not set")
-    url, configured_timeout, tradeoff = _notdiamond_settings()
-    timeout = min(timeout_seconds, configured_timeout)
+    if os.environ.get(CODEX_EVALUATOR_GUARD):
+        raise RuntimeError("recursive Codex evaluator invocation blocked")
+    if not catalog.supports(CODEX_EVALUATOR_MODEL, CODEX_EVALUATOR_EFFORT):
+        raise RuntimeError("Codex evaluator model or effort is unavailable")
+    executable = codex_executable or find_codex_executable()
     started = time.perf_counter()
-    body = {
-        "messages": [
-            {"role": "system", "content": "Route this Codex subagent task by capability."},
-            {"role": "user", "content": _task_excerpt(task)},
-        ],
-        "llm_providers": _proxy_candidates(),
-        "hash_content": True,
-        "cost_quality_tradeoff": tradeoff,
-    }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": "Bearer " + api_key,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        context = ssl.create_default_context()
-        # macOS 的部分 Python 安装没有默认 CA，改用系统证书并保留完整 TLS 校验。
-        if (
-            sys.platform == "darwin"
-            and not os.environ.get("SSL_CERT_FILE")
-            and not os.environ.get("SSL_CERT_DIR")
-            and context.cert_store_stats()["x509_ca"] == 0
-            and Path("/etc/ssl/cert.pem").is_file()
-        ):
-            context.load_verify_locations(cafile="/etc/ssl/cert.pem")
-        with _notdiamond_urlopen(request, timeout=timeout, context=context) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Not Diamond modelSelect failed: {0}".format(exc)) from exc
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-    proxy_model, session_id = _selected_proxy(payload)
-    return _proxy_to_choice(proxy_model, task, catalog, elapsed_ms, session_id)
+    with tempfile.TemporaryDirectory(prefix="codex-router-evaluator-") as temp_dir:
+        directory = Path(temp_dir)
+        schema_path = directory / "schema.json"
+        output_path = directory / "decision.json"
+        schema_path.write_text(
+            json.dumps(_classifier_schema(catalog), sort_keys=True),
+            encoding="utf-8",
+        )
+        command = build_classifier_command(
+            executable,
+            CODEX_EVALUATOR_MODEL,
+            temp_dir,
+            str(schema_path),
+            str(output_path),
+        )
+        popen_kwargs: Dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "cwd": temp_dir,
+            "env": classifier_environment(),
+            "shell": False,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(command, **popen_kwargs)
+        try:
+            stdout, stderr = process.communicate(
+                input=_classifier_prompt(task, surface, catalog),
+                timeout=max(0.1, timeout_seconds),
+            )
+        except subprocess.TimeoutExpired as exc:
+            _terminate_classifier_process(process)
+            raise RuntimeError(
+                "Codex evaluator timed out after {0:.1f}s".format(timeout_seconds)
+            ) from exc
+        except BaseException:
+            _terminate_classifier_process(process)
+            raise
+        if process.returncode != 0:
+            detail = next(
+                (line.strip() for line in reversed(stderr.splitlines()) if line.strip()),
+                "no stderr detail",
+            )
+            raise RuntimeError(
+                "Codex evaluator exited {0}: {1}".format(process.returncode, detail[:240])
+            )
+        thread_id, usage = _evaluator_observability(stdout)
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("Codex evaluator output must be a JSON object")
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        choice = _choice_from_payload(payload, elapsed_ms)
+        if choice.model not in catalog.models:
+            raise ValueError("Codex evaluator selected an unavailable model")
+        if not catalog.supports(choice.model, choice.effort):
+            raise ValueError("Codex evaluator selected an unsupported effort")
+        choice.evaluator_model = CODEX_EVALUATOR_MODEL
+        choice.evaluator_reason = choice.reason
+        choice.evaluator_thread_id = thread_id
+        choice.evaluator_usage = usage
+        return choice
 
 
 def _model_family(model: str) -> str:
@@ -905,22 +909,9 @@ def apply_policy(
     }
     has_high_consequence = any(safety.values()) or risk == "high"
 
-    if has_high_consequence:
-        sol = model if _model_family(model) == "astra" else catalog.preferred("sol")
-        if model != sol:
-            overrides.append("high-consequence task upgraded to Sol")
-        model = sol
-        previous_effort = effort
-        effort = _effort_at_least(catalog, model, effort, "high")
-        if effort != previous_effort:
-            overrides.append("high-consequence task raised to high reasoning")
-        if orchestration != "single":
-            overrides.append("side-effecting task forced to single-agent execution")
+    if has_high_consequence and orchestration != "single":
+        overrides.append("side-effecting task forced to single-agent execution")
         orchestration = "single"
-    elif task_type in ("implement", "debug", "review") and _model_family(model) == "luna":
-        model = catalog.preferred("terra")
-        effort = _effort_at_least(catalog, model, effort, "medium")
-        overrides.append("agentic code task raised to Terra/medium")
 
     short_ambiguous = len(re.findall(r"[\u3400-\u9fff]|[^\W_]+", task)) < 2 or _matches_any(
         task,
@@ -932,14 +923,8 @@ def apply_policy(
         ),
     )
     ambiguous = choice.confidence < 0.55 or short_ambiguous
-    if ambiguous:
-        sol = model if _model_family(model) == "astra" else catalog.preferred("sol")
-        if model != sol or EFFORT_ORDER.index(effort) < EFFORT_ORDER.index("medium"):
-            overrides.append("ambiguous or low-confidence task raised to Sol/medium")
-        model = sol
-        effort = _effort_at_least(catalog, model, effort, "medium")
-        if orchestration != "single":
-            overrides.append("ambiguous task forced to single-agent execution")
+    if ambiguous and orchestration != "single":
+        overrides.append("ambiguous task forced to single-agent execution")
         orchestration = "single"
 
     if surface == "agent":
@@ -986,150 +971,11 @@ def apply_policy(
         classifier_ms=choice.classifier_ms,
         safety=safety,
         overrides=overrides,
-        nd_proxy_model=choice.nd_proxy_model,
-        nd_session_id=choice.nd_session_id,
-        nd_error=choice.nd_error,
-        cache_hit=choice.cache_hit,
-        cache_sample_count=choice.cache_sample_count,
-        cache_similarity=choice.cache_similarity,
-    )
-
-
-def _cache_number(name: str, default: float, minimum: float, maximum: float) -> float:
-    try:
-        value = float(os.environ.get(name, str(default)))
-    except ValueError:
-        value = default
-    return max(minimum, min(maximum, value))
-
-
-def _cache_enabled() -> bool:
-    return os.environ.get("CODEX_ROUTER_CACHE_ENABLED", "1").strip().lower() not in (
-        "0", "false", "no", "off",
-    )
-
-
-def _cache_tokens(task: str) -> List[str]:
-    normalized = task.lower()
-    normalized = re.sub(r"[a-z]:[/\\][^\s]+|(?:\.{0,2}[/\\])[^\s]+", " <path> ", normalized)
-    normalized = re.sub(r"\b\d+(?:\.\d+)?\b", " <number> ", normalized)
-    tokens = re.findall(r"[a-z0-9_.-]+|<[^>]+>", normalized)
-    for chunk in re.findall(r"[\u3400-\u9fff]+", normalized):
-        if len(chunk) == 1:
-            tokens.append(chunk)
-        else:
-            tokens.extend(chunk[index:index + 2] for index in range(len(chunk) - 1))
-    return sorted(set(token for token in tokens if token))
-
-
-def _cache_features(task: str) -> Dict[str, Any]:
-    tokens = _cache_tokens(task)
-    safety = scan_safety(task)
-    return {
-        "task_key": hashlib.sha256("\n".join(tokens).encode("utf-8")).hexdigest(),
-        "token_hashes": [
-            hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
-            for token in tokens
-        ],
-        "task_type": _task_type(task),
-        "active_safety": sorted(key for key, enabled in safety.items() if enabled),
-    }
-
-
-def _cache_similarity(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
-    if left.get("task_type") != right.get("task_type"):
-        return 0.0
-    if left.get("active_safety") != right.get("active_safety"):
-        return 0.0
-    if left.get("task_key") == right.get("task_key"):
-        return 1.0
-    left_tokens = set(left.get("token_hashes") or ())
-    right_tokens = set(right.get("token_hashes") or ())
-    union = left_tokens | right_tokens
-    return len(left_tokens & right_tokens) / len(union) if union else 0.0
-
-
-def route_from_similarity_cache(
-    task: str,
-    catalog: ModelCatalog,
-    surface: str,
-    log_path: Optional[Path] = None,
-) -> Optional[RouteChoice]:
-    """Reuse a stable recent Not Diamond route for highly similar tasks."""
-
-    if not _cache_enabled() or any(scan_safety(task).values()):
-        return None
-    path = log_path or default_log_path()
-    if not path.exists():
-        return None
-    min_samples = int(_cache_number(
-        "CODEX_ROUTER_CACHE_MIN_SAMPLES", ROUTE_CACHE_DEFAULT_MIN_SAMPLES, 2, 100
-    ))
-    similarity_floor = _cache_number(
-        "CODEX_ROUTER_CACHE_SIMILARITY", ROUTE_CACHE_DEFAULT_SIMILARITY, 0.5, 1.0
-    )
-    majority_floor = _cache_number(
-        "CODEX_ROUTER_CACHE_MAJORITY", ROUTE_CACHE_DEFAULT_MAJORITY, 0.5, 1.0
-    )
-    max_age_days = _cache_number(
-        "CODEX_ROUTER_CACHE_MAX_AGE_DAYS", ROUTE_CACHE_DEFAULT_MAX_AGE_DAYS, 0.1, 365
-    )
-    current = _cache_features(task)
-    cutoff = datetime.now(timezone.utc).timestamp() - max_age_days * 86400
-    matches: List[Tuple[Mapping[str, Any], float]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        recent_lines = deque(handle, maxlen=5000)
-    for line in recent_lines:
-        try:
-            record = json.loads(line)
-            route = record.get("route", {})
-            timestamp = datetime.fromisoformat(record["timestamp"]).timestamp()
-        except (KeyError, TypeError, ValueError):
-            continue
-        if (
-            record.get("event") != "route_decision"
-            or record.get("router_version") != ROUTER_VERSION
-            or route.get("source") != "notdiamond"
-            or route.get("surface") != surface
-            or timestamp < cutoff
-            or not isinstance(record.get("cache_features"), Mapping)
-        ):
-            continue
-        similarity = _cache_similarity(current, record["cache_features"])
-        if similarity >= similarity_floor:
-            matches.append((route, similarity))
-    if len(matches) < min_samples:
-        return None
-    route_counts = Counter(
-        (route.get("nd_proxy_model"), route.get("model"), route.get("effort"))
-        for route, _ in matches
-    )
-    (proxy_model, model, effort), count = route_counts.most_common(1)[0]
-    majority = count / len(matches)
-    if majority < majority_floor or model not in catalog.models:
-        return None
-    winning_similarities = [
-        similarity
-        for route, similarity in matches
-        if (route.get("nd_proxy_model"), route.get("model"), route.get("effort"))
-        == (proxy_model, model, effort)
-    ]
-    return RouteChoice(
-        model=str(model),
-        effort=str(effort),
-        orchestration="single",
-        task_type=str(current["task_type"]),
-        risk="low",
-        parallelizable=False,
-        confidence=majority,
-        reason="Stable recent similar-task route cache hit.",
-        safety=_empty_safety(),
-        source="similarity-cache",
-        classifier_ms=0,
-        nd_proxy_model=str(proxy_model) if proxy_model else None,
-        cache_hit=True,
-        cache_sample_count=len(matches),
-        cache_similarity=sum(winning_similarities) / len(winning_similarities),
+        evaluator_model=choice.evaluator_model,
+        evaluator_reason=choice.evaluator_reason,
+        evaluator_thread_id=choice.evaluator_thread_id,
+        evaluator_usage=dict(choice.evaluator_usage),
+        evaluator_error=choice.evaluator_error,
     )
 
 
@@ -1139,64 +985,62 @@ def route_task(
     surface: str = "root",
     heuristic_only: bool = False,
     codex_executable: Optional[str] = None,
-    classifier_timeout_seconds: float = 20.0,
+    classifier_timeout_seconds: float = CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS,
     feedback_log_path: Optional[Path] = None,
     feedback_cwd: Optional[str] = None,
     use_feedback: bool = True,
-    use_cache: bool = True,
 ) -> RoutingDecision:
-    """Classify and policy-check one task, falling back locally on any failure."""
+    """Classify and policy-check one task with the isolated Codex evaluator."""
 
     active_catalog = catalog or discover_catalog(codex_executable)
     if heuristic_only:
         choice = classify_heuristically(task, active_catalog)
     else:
-        choice = None
-        if use_cache:
-            try:
-                choice = route_from_similarity_cache(
-                    task, active_catalog, surface, log_path=feedback_log_path
-                )
-            except (OSError, TypeError, ValueError):
-                choice = None
-        if choice is None:
-            try:
-                choice = classify_with_notdiamond(
-                    task,
-                    active_catalog,
-                    surface,
-                    timeout_seconds=classifier_timeout_seconds,
-                )
-            except (
-                KeyError,
-                OSError,
-                TypeError,
-                ValueError,
-                RuntimeError,
-                subprocess.SubprocessError,
-            ) as exc:
-                choice = RouteChoice(
-                    model=active_catalog.preferred("terra"),
-                    effort=_normalize_effort(active_catalog, active_catalog.preferred("terra"), "medium"),
-                    orchestration="single",
-                    task_type=_task_type(task),
-                    risk="medium",
-                    parallelizable=False,
-                    confidence=0.0,
-                    reason="Not Diamond was unavailable; safe Terra/medium fallback.",
-                    safety=scan_safety(task),
-                    source="notdiamond-fallback",
-                    nd_error=str(exc)[:240],
-                )
+        evaluator_started = time.perf_counter()
+        try:
+            choice = classify_with_codex(
+                task,
+                active_catalog,
+                surface,
+                codex_executable=codex_executable,
+                timeout_seconds=classifier_timeout_seconds,
+            )
+        except (
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            subprocess.SubprocessError,
+        ) as exc:
+            choice = RouteChoice(
+                model=active_catalog.preferred("terra"),
+                effort=_normalize_effort(
+                    active_catalog, active_catalog.preferred("terra"), "medium"
+                ),
+                orchestration="single",
+                task_type=_task_type(task),
+                risk="medium",
+                parallelizable=False,
+                confidence=0.0,
+                reason="Codex evaluator was unavailable; safe Terra/medium fallback.",
+                safety=scan_safety(task),
+                source="codex-evaluator-fallback",
+                classifier_ms=int((time.perf_counter() - evaluator_started) * 1000),
+                evaluator_model=CODEX_EVALUATOR_MODEL,
+                evaluator_reason="Codex evaluator did not return a usable route.",
+                evaluator_error=str(exc)[:240],
+            )
     decision = apply_policy(choice, task, active_catalog, surface=surface)
-    if choice.source == "notdiamond-fallback":
+    if choice.source == "codex-evaluator-fallback":
         terra = active_catalog.preferred("terra")
         decision.model = terra
         decision.effort = _normalize_effort(active_catalog, terra, "medium")
         decision.orchestration = "single"
         decision.parallelizable = False
-        decision.overrides.append("Not Diamond failure forced Terra/medium fallback")
-    if use_feedback:
+        decision.overrides.append("Codex evaluator failure forced Terra/medium fallback")
+    # 在线评估器的选模结果不再由本地任务特征或历史反馈改写。
+    if use_feedback and heuristic_only:
         try:
             return calibrate_with_feedback(
                 task,
@@ -1310,22 +1154,32 @@ def append_decision_log(
     logged_route = decision.as_dict()
     # Classifier prose could echo the task, so never persist its free-text reason.
     logged_route.pop("reason", None)
-    proxy_model = decision.nd_proxy_model or "none"
-    fallback_used = decision.source == "notdiamond-fallback"
-    display = (
-        "{0} | source {1} | ND {2} -> Codex {3} ({4}) | "
-        "session {5} | cache {6}/{7} | fallback {8}"
-    ).format(
-        outcome,
-        decision.source,
-        proxy_model,
-        decision.model,
-        decision.effort,
-        decision.nd_session_id or "none",
-        "hit" if decision.cache_hit else "miss",
-        decision.cache_sample_count,
-        "yes" if fallback_used else "no",
-    )
+    logged_route.pop("evaluator_reason", None)
+    fallback_used = decision.source == "codex-evaluator-fallback"
+    fallback_error = decision.evaluator_error
+    if decision.source.startswith("codex-evaluator"):
+        display = (
+            "{0} | source {1} | evaluator {2}/low ({3} ms) -> Codex {4} ({5}) | "
+            "fallback {6}"
+        ).format(
+            outcome,
+            decision.source,
+            decision.evaluator_model or CODEX_EVALUATOR_MODEL,
+            decision.classifier_ms if decision.classifier_ms is not None else "none",
+            decision.model,
+            decision.effort,
+            "yes" if fallback_used else "no",
+        )
+    else:
+        display = (
+            "{0} | source {1} | Codex {2} ({3}) | fallback {4}"
+        ).format(
+            outcome,
+            decision.source,
+            decision.model,
+            decision.effort,
+            "yes" if fallback_used else "no",
+        )
     record = {
         "event": "route_decision",
         "display": display,
@@ -1338,16 +1192,24 @@ def append_decision_log(
         ),
         "task_name": task_name,
         "codex_session_id": codex_session_id,
-        "cache_features": _cache_features(task),
-        "cache": {
-            "hit": decision.cache_hit,
-            "sample_count": decision.cache_sample_count,
-            "similarity": decision.cache_similarity,
-        },
-        "notdiamond": {
-            "proxy_model": decision.nd_proxy_model,
-            "session_id": decision.nd_session_id,
-            "request_ms": decision.classifier_ms,
+        "evaluator": {
+            "model": decision.evaluator_model,
+            "reasoning_effort": CODEX_EVALUATOR_EFFORT if decision.evaluator_model else None,
+            "summary": (
+                "type={0}; risk={1}; confidence={2:.2f}".format(
+                    decision.task_type if decision.task_type in TASK_TYPES else "other",
+                    decision.risk if decision.risk in RISK_LEVELS else "unknown",
+                    decision.confidence,
+                ) if decision.evaluator_model else None
+            ),
+            "request_ms": (
+                decision.classifier_ms
+                if decision.source.startswith("codex-evaluator")
+                else None
+            ),
+            "thread_id": decision.evaluator_thread_id,
+            "usage": dict(decision.evaluator_usage),
+            "error": decision.evaluator_error,
         },
         "codex": {
             "model": decision.model,
@@ -1356,7 +1218,7 @@ def append_decision_log(
         },
         "fallback": {
             "used": fallback_used,
-            "error": decision.nd_error,
+            "error": fallback_error,
         },
         "cwd_sha256": _cwd_sha256(normalized_cwd),
         "route": logged_route,
@@ -1785,7 +1647,7 @@ def run_hook(
     payload: Mapping[str, Any],
     heuristic_only: bool = False,
     no_log: bool = False,
-    classifier_timeout_seconds: float = 20.0,
+    classifier_timeout_seconds: float = CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS,
 ) -> Optional[Dict[str, Any]]:
     """Route a spawn_agent call at the PreToolUse boundary."""
 

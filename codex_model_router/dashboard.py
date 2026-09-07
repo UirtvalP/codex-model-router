@@ -50,6 +50,7 @@ def _model_family(model: Any) -> str:
 def _route_view(record: Mapping[str, Any], feedback: Mapping[str, str]) -> Dict[str, Any]:
     codex = _mapping(record.get("codex"))
     notdiamond = _mapping(record.get("notdiamond"))
+    evaluator = _mapping(record.get("evaluator"))
     cache = _mapping(record.get("cache"))
     fallback = _mapping(record.get("fallback"))
     route = _mapping(record.get("route"))
@@ -65,8 +66,11 @@ def _route_view(record: Mapping[str, Any], feedback: Mapping[str, str]) -> Dict[
         "task": str(task_name or task_summary),
         "task_summary": str(task_summary),
         "proxy_model": notdiamond.get("proxy_model") or route.get("nd_proxy_model") or "none",
-        "session_id": notdiamond.get("session_id") or route.get("nd_session_id") or "none",
-        "request_ms": notdiamond.get("request_ms") if notdiamond.get("request_ms") is not None else route.get("classifier_ms"),
+        "evaluator_model": evaluator.get("model") or "",
+        "selector_model": evaluator.get("model") or notdiamond.get("proxy_model") or route.get("nd_proxy_model") or "none",
+        "reason": str(evaluator.get("summary") or ""),
+        "session_id": evaluator.get("thread_id") or notdiamond.get("session_id") or route.get("nd_session_id") or "none",
+        "request_ms": evaluator.get("request_ms") if evaluator.get("request_ms") is not None else (notdiamond.get("request_ms") if notdiamond.get("request_ms") is not None else route.get("classifier_ms")),
         "model": str(model),
         "family": _model_family(model),
         "effort": str(effort),
@@ -75,8 +79,8 @@ def _route_view(record: Mapping[str, Any], feedback: Mapping[str, str]) -> Dict[
         "cache_hit": bool(cache.get("hit", route.get("cache_hit", False))),
         "cache_samples": cache.get("sample_count", route.get("cache_sample_count", 0)),
         "cache_similarity": cache.get("similarity", route.get("cache_similarity")),
-        "fallback_used": bool(fallback.get("used", source == "notdiamond-fallback")),
-        "fallback_error": fallback.get("error") or route.get("nd_error"),
+        "fallback_used": bool(fallback.get("used", str(source).endswith("-fallback"))),
+        "fallback_error": fallback.get("error") or evaluator.get("error") or route.get("nd_error"),
         "outcome": record.get("outcome") or "unknown",
         "execution_ms": record.get("execution_ms"),
         "rating": feedback.get(decision_id),
@@ -94,6 +98,7 @@ def build_dashboard_payload(log_path: Path, limit: int = 1000) -> Dict[str, Any]
     feedback: Dict[str, str] = {}
     model_counts: Counter[str] = Counter()
     source_counts: Counter[str] = Counter()
+    models_by_source: Dict[str, Counter[str]] = {}
     total = last_24h = cache_hits = fallbacks = invalid_lines = 0
     latency_total = latency_count = 0
     latest_at: Optional[str] = None
@@ -126,6 +131,7 @@ def build_dashboard_payload(log_path: Path, limit: int = 1000) -> Dict[str, Any]
                 view = _route_view(event, {})
                 model_counts[view["family"]] += 1
                 source_counts[str(view["source"])] += 1
+                models_by_source.setdefault(str(view["source"]), Counter())[view["family"]] += 1
                 cache_hits += int(view["cache_hit"])
                 fallbacks += int(view["fallback_used"])
                 timestamp = _parse_timestamp(view["timestamp"])
@@ -162,6 +168,7 @@ def build_dashboard_payload(log_path: Path, limit: int = 1000) -> Dict[str, Any]
             "latest_at": latest_at,
             "models": dict(model_counts),
             "sources": dict(source_counts),
+            "models_by_source": {source: dict(counts) for source, counts in models_by_source.items()},
         },
         "routes": routes,
     }
@@ -180,7 +187,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .status{display:flex;align-items:center;gap:10px;background:#111927cc;border:1px solid var(--line);padding:10px 14px;border-radius:12px}.dot{width:9px;height:9px;border-radius:50%;background:var(--good);box-shadow:0 0 12px var(--good)}
     button,select,input{font:inherit;color:var(--text);background:#0d1420;border:1px solid var(--line);border-radius:9px;padding:9px 11px;outline:none}button{cursor:pointer}button:hover{border-color:var(--accent)}
     .cards{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:14px;margin-bottom:18px}.card,.panel{background:linear-gradient(145deg,#141c2a,#0f1520);border:1px solid var(--line);border-radius:15px;box-shadow:0 16px 40px #0003}.card{padding:18px}.card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.card .value{font-size:28px;font-weight:730;margin-top:8px}.card .hint{font-size:12px;color:var(--muted);margin-top:3px}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}.panel{padding:18px}.panel h2{font-size:15px;margin:0 0 16px}.bars{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:66px 1fr 56px;align-items:center;gap:10px}.bar-track{height:9px;border-radius:10px;background:#090d14;overflow:hidden}.bar-fill{height:100%;border-radius:10px}.bar-count{text-align:right;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}.panel{padding:18px}.panel h2{font-size:15px;margin:0 0 16px}.bars{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:66px 1fr 110px;align-items:center;gap:10px}.bar-track{height:9px;border-radius:10px;background:#090d14;overflow:hidden}.bar-fill{height:100%;border-radius:10px}.bar-count{text-align:right;color:var(--muted)}
     .filters{display:grid;grid-template-columns:minmax(220px,1fr) repeat(4,150px) auto;gap:10px;margin-bottom:13px}.table-panel{padding:0;overflow:hidden}.table-head{padding:18px 18px 0}.scroll{overflow:auto;max-height:56vh}table{width:100%;border-collapse:collapse;min-width:1100px}th{position:sticky;top:0;background:#111925;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;text-align:left;padding:11px 13px;border-bottom:1px solid var(--line);z-index:1}td{padding:12px 13px;border-bottom:1px solid #202a3a;vertical-align:top}tbody tr:hover{background:#172131}.task{max-width:280px}.task strong{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.small{font-size:12px;color:var(--muted)}
     .pill{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);background:#0b111b;border-radius:99px;padding:4px 8px;font-size:12px;white-space:nowrap}.family-luna{color:var(--luna)}.family-terra{color:var(--terra)}.family-sol{color:var(--sol)}.family-astra{color:var(--astra)}.bad{color:var(--bad)}.good{color:var(--good)}
     .empty{padding:50px;text-align:center;color:var(--muted)}.footer{display:flex;justify-content:space-between;gap:14px;margin-top:12px;color:var(--muted);font-size:12px;word-break:break-all}.error{margin:0 0 14px;background:#341720;border:1px solid #71313d;color:#ffadb5;padding:12px;border-radius:10px;display:none}
@@ -189,19 +196,19 @@ DASHBOARD_HTML = r"""<!doctype html>
 </head>
 <body>
 <main class="shell">
-  <header class="top"><div class="brand"><h1>Codex 路由面板</h1><div class="subtitle">Not Diamond 只选档位，任务仍由 Codex 订阅模型执行</div></div><div class="status"><span class="dot" id="dot"></span><span id="status">正在连接</span><button id="refresh">立即刷新</button></div></header>
+  <header class="top"><div class="brand"><h1>Codex 路由面板</h1><div class="subtitle">Codex 评估器选择执行模型；历史 Not Diamond 记录保留</div></div><div class="status"><span class="dot" id="dot"></span><span id="status">正在连接</span><button id="refresh">立即刷新</button></div></header>
   <div id="error" class="error"></div>
   <section class="cards">
     <article class="card"><div class="label">全部路由</div><div class="value" id="total">—</div><div class="hint" id="shown">读取日志中</div></article>
     <article class="card"><div class="label">最近 24 小时</div><div class="value" id="day">—</div><div class="hint">每次 spawn 独立计数</div></article>
     <article class="card"><div class="label">缓存命中率</div><div class="value" id="cacheRate">—</div><div class="hint" id="cacheCount">稳定相似任务</div></article>
-    <article class="card"><div class="label">回退率</div><div class="value" id="fallbackRate">—</div><div class="hint" id="fallbackCount">ND 失败回退 Terra</div></article>
-    <article class="card"><div class="label">ND 平均延迟</div><div class="value" id="latency">—</div><div class="hint">不含 Codex 执行时间</div></article>
+    <article class="card"><div class="label">回退率</div><div class="value" id="fallbackRate">—</div><div class="hint" id="fallbackCount">评估失败回退 Terra</div></article>
+    <article class="card"><div class="label">选模平均延迟</div><div class="value" id="latency">—</div><div class="hint">不含 Codex 执行时间</div></article>
   </section>
-  <section class="grid"><article class="panel"><h2>Codex 模型分布</h2><div class="bars" id="modelBars"></div></article><article class="panel"><h2>路由来源</h2><div class="bars" id="sourceBars"></div></article></section>
+  <section class="grid" id="sourceModelPanels" aria-label="各来源模型分布"></section>
   <section class="panel table-panel">
     <div class="table-head"><div class="filters"><input id="search" placeholder="搜索任务、模型、session"><select id="family"><option value="">全部模型</option></select><select id="source"><option value="">全部来源</option></select><select id="cache"><option value="">全部缓存</option><option value="hit">缓存命中</option><option value="miss">实时路由</option></select><select id="fallback"><option value="">全部状态</option><option value="yes">仅回退</option><option value="no">无回退</option></select><button id="clear">清除筛选</button></div></div>
-    <div class="scroll"><table><thead><tr><th>时间 / 任务</th><th>Not Diamond 代理</th><th>Codex 执行模型</th><th>来源</th><th>缓存</th><th>回退</th><th>ND 延迟</th><th>Session ID</th><th>结果</th></tr></thead><tbody id="rows"></tbody></table><div id="empty" class="empty" hidden>没有符合筛选条件的路由记录</div></div>
+    <div class="scroll"><table><thead><tr><th>时间 / 任务</th><th>评估器 / 历史代理</th><th>Codex 执行模型</th><th>来源</th><th>缓存</th><th>回退</th><th>选模延迟</th><th>评估摘要 / Session</th><th>结果</th></tr></thead><tbody id="rows"></tbody></table><div id="empty" class="empty" hidden>没有符合筛选条件的路由记录</div></div>
   </section>
   <footer class="footer"><span id="logPath"></span><span id="updated"></span></footer>
 </main>
@@ -211,11 +218,11 @@ const $=id=>document.getElementById(id); const esc=v=>String(v??'').replace(/[&<
 const pct=v=>`${Number(v||0).toFixed(1)}%`; const number=v=>new Intl.NumberFormat('zh-CN').format(v||0);
 function familyName(v){return ({luna:'Luna',terra:'Terra',sol:'Sol',astra:'Astra',other:'Other'})[v]||v}
 function localTime(v){if(!v)return '—'; const d=new Date(v); return Number.isNaN(d.getTime())?'—':d.toLocaleString('zh-CN',{hour12:false})}
-function bars(id,counts,order){const root=$(id), entries=order?order.map(k=>[k,counts[k]||0]):Object.entries(counts).sort((a,b)=>b[1]-a[1]); const max=Math.max(1,...entries.map(x=>x[1])); root.innerHTML=entries.map(([k,v])=>`<div class="bar-row"><span class="family-${esc(k)}">${esc(order?familyName(k):k)}</span><div class="bar-track"><div class="bar-fill" style="width:${v/max*100}%;background:var(--${['luna','terra','sol','astra'].includes(k)?k:'accent'})"></div></div><span class="bar-count">${number(v)}</span></div>`).join('')||'<span class="muted">暂无数据</span>'}
+function renderModelDistributions(groups){const entries=Object.entries(groups||{}).sort((a,b)=>a[0].localeCompare(b[0])), names={'codex-evaluator':'Codex 评估器','notdiamond':'Not Diamond'}; $('sourceModelPanels').innerHTML=entries.map(([source,counts])=>{const total=Object.values(counts).reduce((sum,v)=>sum+v,0), families=['luna','terra','sol','astra',...Object.keys(counts).filter(k=>!['luna','terra','sol','astra'].includes(k))];return `<article class="panel"><h2>${esc(names[source]||source)} · 模型分布</h2><div class="small" style="margin-bottom:16px">${esc(source)} · 共 ${number(total)} 次</div><div class="bars">${families.map(k=>{const v=counts[k]||0, share=total?v/total*100:0;return `<div class="bar-row"><span class="family-${esc(k)}">${esc(familyName(k))}</span><div class="bar-track"><div class="bar-fill" style="width:${share}%;background:var(--${['luna','terra','sol','astra'].includes(k)?k:'accent'})"></div></div><span class="bar-count">${number(v)} · ${pct(share)}</span></div>`}).join('')}</div></article>`}).join('')||'<article class="panel muted">暂无模型分布数据</article>'}
 function optionValues(id,values,label){const select=$(id), old=select.value, unique=[...new Set(values.filter(Boolean))].sort(); select.innerHTML=`<option value="">${label}</option>`+unique.map(v=>`<option value="${esc(v)}">${esc(id==='family'?familyName(v):v)}</option>`).join(''); select.value=old}
 function render(){const s=payload.stats||{}, log=payload.log||{}; $('total').textContent=number(s.total); $('day').textContent=number(s.last_24h); $('cacheRate').textContent=pct(s.cache_rate); $('cacheCount').textContent=`${number(s.cache_hits)} 次命中`; $('fallbackRate').textContent=pct(s.fallback_rate); $('fallbackCount').textContent=`${number(s.fallbacks)} 次回退`; $('latency').textContent=s.avg_request_ms==null?'—':`${number(s.avg_request_ms)} ms`; $('shown').textContent=`显示最近 ${number(log.showing)} 条`; $('logPath').textContent=`日志：${log.path||'未找到'}`; $('updated').textContent=`更新：${localTime(payload.generated_at)}`;
-bars('modelBars',s.models||{},['luna','terra','sol','astra']); bars('sourceBars',s.sources||{}); optionValues('family',payload.routes.map(r=>r.family),'全部模型'); optionValues('source',payload.routes.map(r=>r.source),'全部来源'); renderRows()}
-function renderRows(){const q=$('search').value.trim().toLowerCase(), family=$('family').value, source=$('source').value, cache=$('cache').value, fallback=$('fallback').value; const routes=payload.routes.filter(r=>{const hay=[r.task,r.task_summary,r.proxy_model,r.model,r.session_id,r.decision_id].join(' ').toLowerCase(); return(!q||hay.includes(q))&&(!family||r.family===family)&&(!source||r.source===source)&&(!cache||(cache==='hit')===r.cache_hit)&&(!fallback||(fallback==='yes')===r.fallback_used)}); $('empty').hidden=routes.length>0; $('rows').innerHTML=routes.map(r=>`<tr><td class="task"><strong title="${esc(r.task)}">${esc(r.task)}</strong><span class="small">${esc(localTime(r.timestamp))}</span></td><td><span class="pill">${esc(r.proxy_model)}</span></td><td><span class="pill family-${esc(r.family)}">${esc(r.model)}</span><div class="small">${esc(r.effort)}</div></td><td>${esc(r.source)}</td><td class="${r.cache_hit?'good':''}">${r.cache_hit?`命中 · ${number(r.cache_samples)} 样本`:'实时'}</td><td class="${r.fallback_used?'bad':'good'}" title="${esc(r.fallback_error||'')}">${r.fallback_used?'是':'否'}</td><td>${r.request_ms==null?'—':`${number(r.request_ms)} ms`}</td><td><span class="small" title="${esc(r.session_id)}">${esc(r.session_id==='none'?'—':r.session_id.slice(0,12)+'…')}</span></td><td>${esc(r.rating||r.outcome||'—')}</td></tr>`).join('')}
+renderModelDistributions(s.models_by_source); optionValues('family',payload.routes.map(r=>r.family),'全部模型'); optionValues('source',payload.routes.map(r=>r.source),'全部来源'); renderRows()}
+function renderRows(){const q=$('search').value.trim().toLowerCase(), family=$('family').value, source=$('source').value, cache=$('cache').value, fallback=$('fallback').value; const routes=payload.routes.filter(r=>{const hay=[r.task,r.task_summary,r.selector_model,r.reason,r.model,r.session_id,r.decision_id].join(' ').toLowerCase(); return(!q||hay.includes(q))&&(!family||r.family===family)&&(!source||r.source===source)&&(!cache||(cache==='hit')===r.cache_hit)&&(!fallback||(fallback==='yes')===r.fallback_used)}); $('empty').hidden=routes.length>0; $('rows').innerHTML=routes.map(r=>`<tr><td class="task"><strong title="${esc(r.task)}">${esc(r.task)}</strong><span class="small">${esc(localTime(r.timestamp))}</span></td><td><span class="pill">${esc(r.selector_model)}</span></td><td><span class="pill family-${esc(r.family)}">${esc(r.model)}</span><div class="small">${esc(r.effort)}</div></td><td>${esc(r.source)}</td><td class="${r.cache_hit?'good':''}">${r.cache_hit?`命中 · ${number(r.cache_samples)} 样本`:'实时'}</td><td class="${r.fallback_used?'bad':'good'}" title="${esc(r.fallback_error||'')}">${r.fallback_used?'是':'否'}</td><td>${r.request_ms==null?'—':`${number(r.request_ms)} ms`}</td><td><div class="small">${esc(r.reason)}</div><span class="small" title="${esc(r.session_id)}">${esc(r.session_id==='none'?'—':r.session_id.slice(0,12)+'…')}</span></td><td>${esc(r.rating||r.outcome||'—')}</td></tr>`).join('')}
 async function load(){try{const res=await fetch('/api/routes?limit=1000',{cache:'no-store'});if(!res.ok)throw new Error(`HTTP ${res.status}`);payload=await res.json();$('error').style.display='none';$('dot').style.background='var(--good)';$('status').textContent='实时 · 每 3 秒刷新';render()}catch(e){$('error').textContent=`面板读取失败：${e.message}`;$('error').style.display='block';$('dot').style.background='var(--bad)';$('status').textContent='连接异常'}}
 ['search','family','source','cache','fallback'].forEach(id=>$(id).addEventListener(id==='search'?'input':'change',renderRows));$('clear').onclick=()=>{['search','family','source','cache','fallback'].forEach(id=>$(id).value='');renderRows()};$('refresh').onclick=load;load();setInterval(load,3000);
 </script></body></html>"""

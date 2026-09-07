@@ -1,25 +1,15 @@
 # Codex Model Router MVP
 
-This MVP calls Not Diamond's route-only `modelSelect` endpoint in front of a
-Codex task. It selects a capability proxy, maps that proxy to a Codex model and
-reasoning effort, and sends the original prompt unchanged to Codex. Not
-Diamond never executes the task.
+The online routing path uses a fixed Terra/low Codex CLI evaluator with Fast enabled with the existing
+ChatGPT login. It chooses Luna, Terra, Sol, or Astra directly and returns a
+model, reasoning effort, and short reason. Evaluation failure falls back to
+Terra/medium and is visible in the log. No local task-content rule upgrades
+the selected model.
 
-The default capability mapping is Haiku 4.5 → Luna, Sonnet 4.6 → Terra, Opus
-4.7 → Sol, and Not Diamond's currently available Claude frontier proxy
-(`claude-sonnet-5`) → Astra. The router recognizes `claude-fable-5` and
-`claude-fable-5-1` as Astra proxies for when Not Diamond exposes them; set
-`NOTDIAMOND_FRONTIER_PROXY` to the supported Fable model ID at that point.
-Opus always maps to Sol and is never promoted by local keyword matching.
-
-Up to 12,000 characters are sent to Not Diamond with content hashing enabled.
-`--heuristic-only` keeps routing entirely local. A Not Diamond timeout or API
-failure always falls back to Terra/medium.
-
-The installed Codex CLI is queried for its Luna, Terra, Sol, and Astra catalog, so the
-router only dispatches supported model/effort pairs. The non-sensitive catalog
-is cached for six hours to keep agent routing lean. If classification or model
-discovery fails, a conservative local heuristic takes over.
+There is no external router backend or proxy-model mapping. `--heuristic-only`
+provides explicit offline evaluation. The installed CLI catalog supplies the
+allowed model/effort pairs and is cached for six hours; routing decisions are
+not reused from the removed external-router cache.
 
 ## Try It
 
@@ -94,8 +84,8 @@ child-agent spawns.
 If the user personally names a child model, the parent adds
 `[codex-router:preserve-model]` at the start of the child message and passes the
 requested route fields. The hook strips that marker, preserves the requested
-model/effort, skips Not Diamond, and still writes an `explicit-user-model`
-record so the dashboard shows what the child actually runs.
+model/effort, skips evaluation, and still writes an `explicit-user-model`
+record so the dashboard shows the requested child route.
 
 Codex asks you to review and trust new hooks before they run. Start a new task
 and use `/hooks` after installation. The installer merges rather than replacing
@@ -116,30 +106,28 @@ relax the child agent's sandbox, approvals, or downstream tool permissions.
 
 ## Safety And Privacy
 
-- The route-only request receives up to 12,000 characters and uses
-  `NOTDIAMOND_API_KEY`, content hashing, and a bounded timeout. It never
-  executes Codex or another model itself. Use `--heuristic-only` to avoid the
-  network request.
+- The default evaluator receives a bounded task excerpt in an ephemeral,
+  read-only Codex process with hooks, shell, delegation, plugins, and rules
+  disabled. It consumes subscription usage and adds a model-call delay.
+  Use `--heuristic-only` to avoid the network call.
 - The real task retains normal Codex configuration, approval rules, hooks, and
   sandbox. The router only passes a sandbox when you explicitly provide one.
-- Raw prompts and free-text route explanations are never written to the router log. The default log is
+- Raw prompts are not written to the router log; only a controlled evaluation summary is stored. The default log is
   `%LOCALAPPDATA%\CodexModelRouter\decisions.jsonl` on Windows and
   `~/.codex/router/decisions.jsonl` elsewhere; it contains a non-sensitive task
-  summary, hashes, structured features, proxy/session information, the decision,
+  summary, hashes, structured features, evaluator/session information, the decision,
   fallback errors, timings, and exit status.
 - If the subagent hook fails, the original `spawn_agent` call proceeds unchanged.
 
-High-consequence work involving external writes, deletion, money, credentials,
-security, legal or medical decisions, persisted data, or public deployment is
-forced to Sol/high or stronger and single-agent execution. Ultra is reserved
-for safe root tasks with genuinely independent workstreams.
+Safety metadata can restrict orchestration and unsupported effort values are
+normalized. These checks do not impose content-based model upgrades.
 
 ## Routing dashboard
 
 Run `py -3 -m codex_model_router.dashboard` on Windows or
 `python3 -m codex_model_router.dashboard` on macOS/Linux. The local-only page at
 `http://127.0.0.1:8765/` refreshes every three seconds and summarizes model
-distribution, cache hits, fallbacks, Not Diamond latency, and individual route
+distribution, cache hits, fallbacks, evaluation latency and controlled summaries, and individual route
 records. The server is read-only and never binds to a LAN interface.
 
 ## Existing Codex History
@@ -162,15 +150,9 @@ py -3 .\tools\codex_route.py `
 ```
 
 Ratings are `good`, `underpowered`, `overkill`, and `failed`. They are appended
-without prompt text. On the next route, an exact task reuses or adjusts its
-previous route immediately: `underpowered` moves up, `overkill` moves down, and
-`good` anchors the prior choice. For similar structured task categories, the
-router waits for at least three labels and a two-thirds majority before
-adjusting. Feedback is scoped to the same working directory and the same root/agent
-surface, and it can never reverse direction relative to the fresh classifier
-route. Safety floors are reapplied after every learned adjustment.
-`failed` is retained for evaluation but does not automatically spend more,
-because an execution failure is not necessarily a model-capability failure.
+without prompt text. Automatic feedback adjustments apply only to explicit
+heuristic-only mode, never to live evaluator decisions. An execution
+failure alone does not prove the selected model was underpowered.
 
 This is deliberately feedback learning, not fictional counterfactual learning:
 old Codex transcripts say which model ran, but do not prove which untried model

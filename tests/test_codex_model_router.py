@@ -16,7 +16,6 @@ from codex_model_router.router import (
     RouteChoice,
     RoutingDecision,
     _catalog_from_payload,
-    _proxy_to_choice,
     append_decision_log,
     append_feedback,
     apply_policy,
@@ -25,7 +24,6 @@ from codex_model_router.router import (
     calibrate_with_feedback,
     classifier_environment,
     classify_heuristically,
-    classify_with_notdiamond,
     discover_catalog,
     dispatch_codex,
     hook_updated_input,
@@ -341,15 +339,15 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
 
-    def test_luna_implementation_is_raised_to_terra_medium(self):
+    def test_luna_implementation_preserves_selected_model(self):
         decision = apply_policy(
             choice(task_type="implement"),
             "Implement a small local parser helper",
             catalog(),
         )
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-terra", "medium"))
+        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
 
-    def test_public_deploy_is_sol_high_single(self):
+    def test_public_deploy_keeps_model_and_single_orchestration(self):
         decision = apply_policy(
             choice(
                 orchestration="multi_agent",
@@ -359,20 +357,16 @@ class PolicyTests(unittest.TestCase):
             "Deploy the public service to production",
             catalog(),
         )
-        self.assertEqual(decision.model, "gpt-5.6-sol")
-        self.assertGreaterEqual(
-            ("low", "medium", "high", "xhigh", "max", "ultra").index(decision.effort),
-            2,
-        )
+        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
         self.assertEqual(decision.orchestration, "single")
 
-    def test_external_calendar_write_is_sol_high_single(self):
+    def test_external_calendar_does_not_raise_model(self):
         decision = apply_policy(
             choice(task_type="external_action"),
             "Create a Google Calendar event for tomorrow",
             catalog(),
         )
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-sol", "high"))
+        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
         self.assertTrue(decision.safety["external_write"])
         self.assertEqual(decision.orchestration, "single")
 
@@ -643,152 +637,11 @@ class HookAndLogTests(unittest.TestCase):
                 self.assertIn("model", result["hookSpecificOutput"]["updatedInput"])
         self.assertIsNone(re.fullmatch(matcher, "exec_command"))
 
-    def test_macos_empty_ca_uses_system_bundle_and_respects_overrides(self):
-        from unittest.mock import MagicMock
-        cases = [("darwin", 0, {}, True), ("darwin", 2, {}, False),
-                 ("linux", 0, {}, False), ("darwin", 0, {"SSL_CERT_FILE": "/custom.pem"}, False),
-                 ("darwin", 0, {"SSL_CERT_DIR": "/custom"}, False)]
-        for platform, roots, overrides, expected in cases:
-            context = MagicMock()
-            context.cert_store_stats.return_value = {"x509_ca": roots}
-            response = MagicMock()
-            response.__enter__.return_value.read.return_value = b'{"providers":[{"model":"gpt-5.6-terra"}]}'
-            with self.subTest(platform=platform, roots=roots, overrides=overrides), patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test", **overrides}, clear=True), patch("codex_model_router.router.sys.platform", platform), patch("codex_model_router.router.ssl.create_default_context", return_value=context), patch("codex_model_router.router.Path.is_file", return_value=True), patch("codex_model_router.router._notdiamond_urlopen", return_value=response) as request:
-                classify_with_notdiamond("Compute 2+2", catalog(), "agent")
-                self.assertEqual(context.load_verify_locations.called, expected)
-                self.assertIs(request.call_args.kwargs["context"], context)
-                if expected:
-                    context.load_verify_locations.assert_called_once_with(cafile="/etc/ssl/cert.pem")
-
-    def test_notdiamond_preserves_direct_gpt_and_maps_only_frontier(self):
-        from unittest.mock import Mock
-        proxies = {
-            "gpt-5.6-luna": "gpt-5.6-luna",
-            "gpt-5.6-terra": "gpt-5.6-terra",
-            "gpt-5.6-sol": "gpt-5.6-sol",
-            "claude-sonnet-5": "gpt-6-astra",
-        }
-        for proxy, expected in proxies.items():
-            response = Mock()
-            response.__enter__ = lambda self: self
-            response.__exit__ = lambda *args: None
-            response.read.return_value = json.dumps({
-                "providers": [{"provider": "openai", "model": proxy}],
-                "session_id": "session-1",
-            }).encode("utf-8")
-            with self.subTest(proxy=proxy), patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test-key"}), patch("codex_model_router.router._notdiamond_urlopen", return_value=response):
-                selected = classify_with_notdiamond("Implement this task", catalog(), "agent")
-            self.assertEqual(selected.model, expected)
-            self.assertEqual(selected.nd_proxy_model, proxy)
-            self.assertEqual(selected.nd_session_id, "session-1")
-
-    def test_opus_normally_maps_to_sol(self):
-        task = "Review this implementation"
-        decision = apply_policy(
-            choice(
-                model="gpt-5.6-sol",
-                effort="high",
-                task_type="review",
-                source="notdiamond",
-                nd_proxy_model="gpt-5.6-sol",
-            ),
-            task,
-            catalog(),
-            surface="agent",
-        )
-        self.assertEqual(decision.model, "gpt-5.6-sol")
-
-    def test_extreme_opus_task_still_maps_to_sol(self):
-        task = "Analyze a difficult cross-service concurrency and consistency root cause"
-        decision = apply_policy(
-            choice(
-                model="gpt-5.6-sol",
-                effort="high",
-                task_type="debug",
-                source="notdiamond",
-                nd_proxy_model="gpt-5.6-sol",
-            ),
-            task,
-            catalog(),
-            surface="agent",
-        )
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-sol", "high"))
-
-    def test_configured_frontier_maps_to_astra(self):
-        with patch.dict(os.environ, {"NOTDIAMOND_FRONTIER_PROXY": "claude-fable-5-1"}):
-            selected = _proxy_to_choice("claude-fable-5-1", "Analyze architecture", catalog(), 12, "test")
-        self.assertEqual((selected.model, selected.effort), ("gpt-6-astra", "high"))
-
-    def test_notdiamond_failure_falls_back_to_terra_medium(self):
-        with patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test-key"}), patch("codex_model_router.router.classify_with_notdiamond", side_effect=RuntimeError("timeout")):
-            decision = route_task("Implement a small helper", catalog=catalog(), surface="agent", use_feedback=False, use_cache=False)
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-terra", "medium"))
-        self.assertEqual(decision.source, "notdiamond-fallback")
-        self.assertIn("timeout", decision.nd_error)
-
-    def test_similarity_cache_requires_enough_successful_samples(self):
-        task = "Run the parser unit tests"
-        live_choice = choice(
-            model="gpt-5.6-terra",
-            effort="medium",
-            task_type="answer",
-            source="notdiamond",
-            nd_proxy_model="gpt-5.6-terra",
-        )
-        live_decision = apply_policy(live_choice, task, catalog(), surface="agent")
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "decisions.jsonl"
-            for _ in range(4):
-                append_decision_log(task, live_decision, "agent_hook", log_path=path)
-            with patch("codex_model_router.router.classify_with_notdiamond", return_value=live_choice) as router:
-                decision = route_task(
-                    task,
-                    catalog=catalog(),
-                    surface="agent",
-                    feedback_log_path=path,
-                    use_feedback=False,
-                )
-        router.assert_called_once()
-        self.assertEqual(decision.source, "notdiamond")
-        self.assertFalse(decision.cache_hit)
-
-    def test_similarity_cache_skips_notdiamond_after_stable_sample_threshold(self):
-        task = "Run the parser unit tests"
-        live_decision = apply_policy(
-            choice(
-                model="gpt-5.6-terra",
-                effort="medium",
-                task_type="answer",
-                source="notdiamond",
-                nd_proxy_model="gpt-5.6-terra",
-            ),
-            task,
-            catalog(),
-            surface="agent",
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "decisions.jsonl"
-            for _ in range(5):
-                append_decision_log(task, live_decision, "agent_hook", log_path=path)
-            with patch("codex_model_router.router.classify_with_notdiamond") as router:
-                decision = route_task(
-                    "Run parser unit tests",
-                    catalog=catalog(),
-                    surface="agent",
-                    feedback_log_path=path,
-                    use_feedback=False,
-                )
-        router.assert_not_called()
-        self.assertEqual(decision.source, "similarity-cache")
-        self.assertTrue(decision.cache_hit)
-        self.assertEqual(decision.cache_sample_count, 5)
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-terra", "medium"))
-
     def test_recursive_spawn_calls_route_for_each_hook_invocation(self):
         payload = {"tool_name": "spawn_agent", "tool_input": {"message": "Inspect the module"}}
-        first = apply_policy(choice(model="gpt-5.6-luna"), "Inspect the module", catalog(), surface="agent")
-        second = apply_policy(choice(model="gpt-5.6-sol", effort="high"), "Inspect the module", catalog(), surface="agent")
-        with patch("codex_model_router.router.discover_catalog", return_value=catalog()), patch("codex_model_router.router.classify_with_notdiamond", side_effect=[first, second]) as route:
+        first = choice(model="gpt-5.6-luna", source="codex-evaluator")
+        second = choice(model="gpt-5.6-sol", effort="high", source="codex-evaluator")
+        with patch("codex_model_router.router.discover_catalog", return_value=catalog()), patch("codex_model_router.router.classify_with_codex", side_effect=[first, second]) as route:
             self.assertIsNotNone(run_hook(payload, no_log=True))
             self.assertIsNotNone(run_hook(payload, no_log=True))
         self.assertEqual(route.call_count, 2)
@@ -1083,74 +936,7 @@ class CliSpawnRouteTests(unittest.TestCase):
         )
 
 
-class DirectDNSTests(unittest.TestCase):
-    def test_direct_connection_preserves_tls_hostname_and_context(self):
-        import ssl
-        import urllib.request
-        from unittest.mock import Mock
-        from codex_model_router.router import _notdiamond_urlopen
-        context = ssl.create_default_context()
-        sock = Mock()
-        response = Mock(code=200)
-        def open_connection(handler, connection_class, request, **kwargs):
-            self.assertEqual(request.host, "api.notdiamond.ai")
-            self.assertIs(kwargs["context"], context)
-            connection = connection_class(request.host, timeout=request.timeout, **kwargs)
-            connection.connect()
-            return response
-        request = urllib.request.Request("https://api.notdiamond.ai/v2/modelRouter/modelSelect", data=b'{}')
-        with patch("codex_model_router.router.sys.platform", "darwin"), patch("codex_model_router.router.urllib.request.getproxies", return_value={}), patch("codex_model_router.router.subprocess.run", return_value=Mock(stdout="alias.example.\n216.24.57.15\n")) as dig, patch("codex_model_router.router.socket.create_connection", return_value=sock) as connect, patch.object(context, "wrap_socket", return_value=sock) as tls, patch("urllib.request.HTTPSHandler.do_open", autospec=True, side_effect=open_connection):
-            self.assertIs(_notdiamond_urlopen(request, 8, context), response)
-        self.assertEqual(connect.call_args.args[0], ("216.24.57.15", 443))
-        self.assertEqual(tls.call_args.kwargs["server_hostname"], "api.notdiamond.ai")
-        self.assertTrue(context.check_hostname)
-        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
-        self.assertLessEqual(dig.call_args.kwargs["timeout"], 2)
-
-    def test_empty_dns_fails_without_system_resolution(self):
-        import ssl
-        import urllib.request
-        from unittest.mock import Mock
-        from codex_model_router.router import _notdiamond_urlopen
-        request = urllib.request.Request("https://api.notdiamond.ai/v2/modelRouter/modelSelect")
-        with patch("codex_model_router.router.sys.platform", "darwin"), patch("codex_model_router.router.urllib.request.getproxies", return_value={}), patch("codex_model_router.router.subprocess.run", return_value=Mock(stdout="alias.example.\n")), patch("codex_model_router.router.socket.getaddrinfo") as dns:
-            with self.assertRaisesRegex(OSError, "no IPv4"):
-                _notdiamond_urlopen(request, 8, ssl.create_default_context())
-            dns.assert_not_called()
-
-    def test_proxy_custom_endpoint_and_other_platform_keep_original_transport(self):
-        import ssl
-        import urllib.request
-        from unittest.mock import Mock
-        from codex_model_router.router import _notdiamond_urlopen
-        for platform, url, proxies in [("linux", "https://api.notdiamond.ai/", {}), ("darwin", "https://custom.example/", {}), ("darwin", "https://api.notdiamond.ai/", {"https": "http://127.0.0.1:7890"})]:
-            with self.subTest(platform=platform, url=url, proxies=proxies), patch("codex_model_router.router.sys.platform", platform), patch("codex_model_router.router.urllib.request.getproxies", return_value=proxies), patch("codex_model_router.router.urllib.request.urlopen", return_value=Mock()) as original, patch("codex_model_router.router.subprocess.run") as dig:
-                request = urllib.request.Request(url)
-                context = ssl.create_default_context()
-                _notdiamond_urlopen(request, 8, context)
-                original.assert_called_once_with(request, timeout=8, context=context)
-                dig.assert_not_called()
-
-    def test_dns_timeout_uses_existing_route_fallback(self):
-        import subprocess
-        with patch.dict(os.environ, {"NOTDIAMOND_API_KEY": "test-key"}), patch("codex_model_router.router.sys.platform", "darwin"), patch("codex_model_router.router.urllib.request.getproxies", return_value={}), patch("codex_model_router.router.subprocess.run", side_effect=subprocess.TimeoutExpired("dig", 2)):
-            decision = route_task("Compute 2+2", catalog=catalog(), use_cache=False, use_feedback=False)
-        self.assertEqual(decision.source, "notdiamond-fallback")
-        self.assertEqual(decision.model, "gpt-5.6-terra")
-
-
 class DirectModelPolicyTests(unittest.TestCase):
-    def test_candidates_are_direct_gpt_plus_one_frontier(self):
-        from codex_model_router.router import _proxy_candidates
-        with patch.dict(os.environ, {"NOTDIAMOND_FRONTIER_PROXY": "claude-sonnet-5"}):
-            providers = _proxy_candidates()
-        self.assertEqual(providers, [
-            {"provider": "openai", "model": "gpt-5.6-luna"},
-            {"provider": "openai", "model": "gpt-5.6-terra"},
-            {"provider": "openai", "model": "gpt-5.6-sol"},
-            {"provider": "anthropic", "model": "claude-sonnet-5"},
-        ])
-
     def test_complete_chinese_tasks_do_not_trigger_ambiguous_floor(self):
         for task in ("只返回2加2的结果，不要解释。", "只读查看package.json，列出scripts中的构建命令，不修改任何文件。", "只读核对这段代码的参数与接口契约，返回依据。"):
             with self.subTest(task=task):
@@ -1158,11 +944,11 @@ class DirectModelPolicyTests(unittest.TestCase):
                 self.assertEqual((result.model, result.effort), ("gpt-5.6-luna", "low"))
                 self.assertFalse(result.overrides)
 
-    def test_vague_chinese_and_english_still_use_safety_floor(self):
+    def test_vague_chinese_and_english_preserve_model(self):
         for task in ("继续", "改一下", "重试！", "continue", "it"):
             with self.subTest(task=task):
                 result = apply_policy(choice(), task, catalog(), "agent")
-                self.assertEqual(result.model, "gpt-5.6-sol")
+                self.assertEqual((result.model, result.effort), ("gpt-5.6-luna", "low"))
 
     def test_astra_is_never_downgraded_by_sol_safety_floor(self):
         for task, flags in [("Deploy to production", {"public_deployment": True}), ("继续", {})]:
@@ -1170,10 +956,24 @@ class DirectModelPolicyTests(unittest.TestCase):
                 result = apply_policy(choice(model="gpt-6-astra", effort="high", safety=flags), task, catalog(), "agent")
                 self.assertEqual((result.model, result.effort), ("gpt-6-astra", "high"))
 
-    def test_old_claude_proxies_are_not_accepted_as_direct_gpt(self):
-        for model in ("claude-opus-4.7", "claude-haiku-4-5", "claude-sonnet-4.6"):
-            with self.subTest(model=model), self.assertRaises(ValueError):
-                _proxy_to_choice(model, "List files", catalog(), 1, None)
+class EvaluatorSelectionPreservationTests(unittest.TestCase):
+    def test_evaluator_routes_ignore_content_and_feedback_upgrades(self):
+        for task in ("Fix a parser bug", "Deploy production database", "继续", "修复格式化函数", "Review security access control"):
+            for family, effort in (("luna", "low"), ("terra", "medium"), ("sol", "high"), ("astra", "high")):
+                model = catalog().preferred(family)
+                selected = choice(
+                    model=model,
+                    effort=effort,
+                    source="codex-evaluator",
+                    confidence=0.1,
+                )
+                with self.subTest(task=task, model=model), patch(
+                    "codex_model_router.router.classify_with_codex",
+                    return_value=selected,
+                ), patch("codex_model_router.router.calibrate_with_feedback") as feedback:
+                    result = route_task(task, catalog=catalog(), surface="agent")
+                    self.assertEqual((result.model, result.effort), (model, effort))
+                    feedback.assert_not_called()
 
 
 if __name__ == "__main__":
