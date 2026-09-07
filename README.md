@@ -3,13 +3,13 @@
 An experimental, local-first router that chooses a Codex model, reasoning
 effort, and safe delegation policy before a task runs.
 
-By default, a fixed Terra/low Codex CLI evaluator with Fast enabled chooses directly among
-Luna, Terra, Sol, and Astra, then the selected Codex subscription model runs
-the task. The evaluator uses the existing ChatGPT login. If evaluation fails,
-the hook falls back to Terra/medium and records the failure.
+By default, a fixed GPT-5.3 Codex Spark/low CLI evaluator chooses directly
+among Luna, Terra, Sol, and Astra, then the selected Codex subscription model
+runs the task. The evaluator uses the existing ChatGPT login. If evaluation
+fails, the hook falls back to Terra/medium and records the failure.
 
 ```text
-prompt -> Codex evaluator (Terra/low) -> selected Codex model + reasoning effort
+prompt -> Codex Spark evaluator (low) -> selected Codex model + reasoning effort
 ```
 
 This is an MVP, not an official OpenAI project.
@@ -155,10 +155,11 @@ default_subagent_model = "gpt-5.6-terra"
 default_subagent_reasoning_effort = "medium"
 ```
 
-The online evaluator is Codex only. It requests `service_tier="fast"` with
-`fast_mode` enabled and keeps Terra/low fixed. `--heuristic-only` remains
-available for explicit offline routing. No external router, proxy-model mapping,
-or external-router cache is used.
+The online evaluator is Codex only and keeps GPT-5.3 Codex Spark/low fixed.
+Spark is used directly without `fast_mode` or `service_tier="fast"`, which are
+not advertised for this model. `--heuristic-only` remains available for
+explicit offline routing. No external router, proxy-model mapping, or
+external-router cache is used.
 
 ## Feedback
 

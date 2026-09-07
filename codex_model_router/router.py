@@ -24,9 +24,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-ROUTER_VERSION = "0.8.0"
+ROUTER_VERSION = "0.8.1"
 PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
-CODEX_EVALUATOR_MODEL = "gpt-5.6-terra"
+CODEX_EVALUATOR_MODEL = "gpt-5.3-codex-spark"
 CODEX_EVALUATOR_EFFORT = "low"
 CODEX_EVALUATOR_GUARD = "CODEX_MODEL_ROUTER_EVALUATOR"
 CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -613,10 +613,6 @@ def build_classifier_command(
         evaluator_model,
         "-c",
         'model_reasoning_effort="low"',
-        "--enable",
-        "fast_mode",
-        "-c",
-        'service_tier="fast"',
         "-c",
         'model_verbosity="low"',
         "-c",
@@ -768,8 +764,6 @@ def classify_with_codex(
 
     if os.environ.get(CODEX_EVALUATOR_GUARD):
         raise RuntimeError("recursive Codex evaluator invocation blocked")
-    if not catalog.supports(CODEX_EVALUATOR_MODEL, CODEX_EVALUATOR_EFFORT):
-        raise RuntimeError("Codex evaluator model or effort is unavailable")
     executable = codex_executable or find_codex_executable()
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="codex-router-evaluator-") as temp_dir:

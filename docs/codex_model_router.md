@@ -1,10 +1,11 @@
 # Codex Model Router MVP
 
-The online routing path uses a fixed Terra/low Codex CLI evaluator with Fast enabled with the existing
-ChatGPT login. It chooses Luna, Terra, Sol, or Astra directly and returns a
-model, reasoning effort, and short reason. Evaluation failure falls back to
-Terra/medium and is visible in the log. No local task-content rule upgrades
-the selected model.
+The online routing path uses a fixed GPT-5.3 Codex Spark/low CLI evaluator with
+the existing ChatGPT login. It chooses Luna, Terra, Sol, or Astra directly and
+returns a model, reasoning effort, and short reason. Spark is used without the
+separate Fast service tier because that tier is not advertised for this model.
+Evaluation failure falls back to Terra/medium and is visible in the log. No
+local task-content rule upgrades the selected model.
 
 There is no external router backend or proxy-model mapping. `--heuristic-only`
 provides explicit offline evaluation. The installed CLI catalog supplies the

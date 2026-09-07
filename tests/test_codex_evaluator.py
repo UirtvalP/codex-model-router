@@ -73,15 +73,16 @@ class SuccessfulProcess:
 
 
 class CodexEvaluatorTests(unittest.TestCase):
-    def test_classifier_command_uses_fixed_isolated_evaluator(self):
+    def test_classifier_command_uses_fixed_isolated_spark_evaluator(self):
         command = build_classifier_command(
             "codex", CODEX_EVALUATOR_MODEL, "empty", "schema.json", "output.json"
         )
         joined = " ".join(command)
         self.assertIn(CODEX_EVALUATOR_MODEL, command)
         self.assertIn('model_reasoning_effort="low"', command)
-        self.assertIn('service_tier="fast"', command)
-        self.assertIn("--enable fast_mode", joined)
+        self.assertEqual(CODEX_EVALUATOR_MODEL, "gpt-5.3-codex-spark")
+        self.assertNotIn('service_tier="fast"', command)
+        self.assertNotIn("--enable fast_mode", joined)
         for feature in (
             "shell_tool",
             "multi_agent",
