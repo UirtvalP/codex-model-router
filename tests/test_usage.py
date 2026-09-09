@@ -104,6 +104,7 @@ class UsageTests(unittest.TestCase):
         with sqlite3.connect(self.home/'state_5.sqlite') as db:
             db.execute('create table threads (id text, title text, name text)')
             db.execute('insert into threads values (?,?,?)',('s3','Original prompt','Conversation title'))
+        db.close()
         future=(now+timedelta(days=2)).date().isoformat()
         d=self.read(start=future,end=future)
         self.assertEqual(d['summary']['total_tokens'],0)
