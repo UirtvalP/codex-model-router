@@ -1,4 +1,6 @@
 import json
+import sqlite3
+from datetime import datetime, timedelta
 import tempfile
 import unittest
 from pathlib import Path
@@ -85,6 +87,29 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(self.read()['summary']['input_tokens'],200)
         self.write('a.jsonl',self.base()+[modern(100,thread='other'),legacy(counts(100))])
         self.assertEqual(self.read()['summary']['input_tokens'],200)
+
+    def test_daily_model_breakdown_preserves_totals(self):
+        self.write('a.jsonl', self.base()+[modern(100), event('turn_context', {'model':'sol'}), modern(200,'r2')])
+        d=self.read();day=d['by_day'][0]
+        self.assertEqual({m['model']:m['input_tokens'] for m in day['models']}, {'terra':100,'sol':200})
+        for field in ['input_tokens','output_tokens','cached_input_tokens','uncached_input_tokens','total_tokens']:
+            self.assertEqual(sum(m[field] for m in day['models']),day[field])
+
+    def test_titles_and_top_week_ignore_selected_date_filter(self):
+        now=datetime.now().astimezone()
+        for i in range(4):
+            row=modern((i+1)*100,'rank'+str(i),'s'+str(i))
+            row['timestamp']=now.isoformat()
+            self.write(str(i)+'.jsonl',[event('session_meta',{'id':'s'+str(i)}),row])
+        with sqlite3.connect(self.home/'state_5.sqlite') as db:
+            db.execute('create table threads (id text, title text, name text)')
+            db.execute('insert into threads values (?,?,?)',('s3','Original prompt','Conversation title'))
+        future=(now+timedelta(days=2)).date().isoformat()
+        d=self.read(start=future,end=future)
+        self.assertEqual(d['summary']['total_tokens'],0)
+        self.assertEqual([r['session_id'] for r in d['top_week_sessions']],['s3','s2','s1'])
+        self.assertEqual(d['top_week_sessions'][0]['title'],'Conversation title')
+        self.assertEqual(self.read()['by_session'][0]['title'],'Conversation title')
 
     def test_archived_and_broken_line(self):
         p=self.write('a.jsonl',self.base()+[modern(100)])

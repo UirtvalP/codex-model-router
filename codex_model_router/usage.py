@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 from bisect import bisect_left
 import threading
+import sqlite3
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
@@ -171,6 +172,40 @@ def _cached(path, router=False):
         return [], 1, set()
 
 
+def _session_titles(home):
+    titles = {}
+    index = Path(home) / 'session_index.jsonl'
+    try:
+        with index.open(encoding='utf-8') as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                    if isinstance(row, dict) and row.get('id') and row.get('thread_name'):
+                        titles[str(row['id'])] = str(row['thread_name'])
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    for database in sorted(Path(home).glob('state_*.sqlite'), key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else 0):
+        connection = None
+        try:
+            connection = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.5)
+            columns = {r[1] for r in connection.execute('pragma table_info(threads)')}
+            if 'id' not in columns or 'title' not in columns:
+                continue
+            query = 'select id, title, name from threads' if 'name' in columns else 'select id, title, NULL from threads'
+            for thread, title, name in connection.execute(query):
+                value = name or titles.get(str(thread)) or title
+                if value:
+                    titles[str(thread)] = str(value)
+        except (sqlite3.Error, OSError):
+            continue
+        finally:
+            if connection is not None:
+                connection.close()
+    return titles
+
+
 def build_usage_payload(codex_home: Path, log_path: Path, start: str = '', end: str = '') -> dict:
     """Aggregate requests by local event date, model and actual thread identity."""
     first = date.fromisoformat(start) if start else None
@@ -197,7 +232,11 @@ def build_usage_payload(codex_home: Path, log_path: Path, start: str = '', end: 
                 del _CACHE[key]
         seen = set()
         summary = defaultdict(int)
-        models, days, sessions = {}, {}, {}
+        models, days, sessions, day_models = {}, {}, {}, {}
+        week_sessions = {}
+        today = datetime.now().astimezone().date()
+        week_start = today - timedelta(days=6)
+        titles = _session_titles(codex_home)
         duplicates = 0
         for key, timestamp, session, model, source, usage in sorted(rows, key=lambda r: r[1]):
             if key in seen:
@@ -205,20 +244,27 @@ def build_usage_payload(codex_home: Path, log_path: Path, start: str = '', end: 
                 continue
             seen.add(key)
             day = datetime.fromisoformat(timestamp).date()
+            if week_start <= day <= today:
+                weekly = week_sessions.setdefault(session, defaultdict(int))
+                for field in FIELDS:
+                    weekly[field] += usage[field]
             if (first and day < first) or (last and day > last):
                 continue
             by_model = models.setdefault(model, defaultdict(int))
             by_day = days.setdefault(day.isoformat(), defaultdict(int))
+            by_day_model = day_models.setdefault(day.isoformat(), {}).setdefault(model, defaultdict(int))
             by_session = sessions.setdefault(session, {'usage': defaultdict(int), 'models': set(), 'source': source})
             by_session['models'].add(model)
             for field in FIELDS:
-                for target in (summary, by_model, by_day, by_session['usage']):
+                for target in (summary, by_model, by_day, by_day_model, by_session['usage']):
                     target[field] += usage[field]
         return {
             'summary': _metrics(summary),
             'by_model': sorted([dict(model=k, **_metrics(v)) for k, v in models.items()], key=lambda r: -r['total_tokens']),
-            'by_day': [dict(date=k, **_metrics(v)) for k, v in sorted(days.items(), reverse=True)],
-            'by_session': sorted([dict(session_id=k, models=sorted(v['models']), source=v['source'], **_metrics(v['usage'])) for k, v in sessions.items()], key=lambda r: -r['total_tokens']),
+            'by_day': [dict(date=k, models=[dict(model=m, **_metrics(c)) for m, c in sorted(day_models[k].items())], **_metrics(v)) for k, v in sorted(days.items(), reverse=True)],
+            'by_session': sorted([dict(session_id=k, title=titles.get(k) or ('路由评估' if v['source'] == 'evaluator' else '未命名对话'), models=sorted(v['models']), source=v['source'], **_metrics(v['usage'])) for k, v in sessions.items()], key=lambda r: -r['total_tokens']),
+            'top_week_sessions': sorted([dict(session_id=k, title=titles.get(k) or '未命名对话', **_metrics(v)) for k, v in week_sessions.items()], key=lambda r: (-r['total_tokens'], r['session_id']))[:3],
+            'week_range': {'start': week_start.isoformat(), 'end': today.isoformat()},
             'coverage': {'files': len(files), 'errors': errors, 'duplicates_removed': duplicates,
                          'note': '本机保留日志；按事件日期统计，旧格式缺失历史、未知模型及未落盘调用可能不完整'},
         }

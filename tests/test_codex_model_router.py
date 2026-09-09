@@ -126,7 +126,7 @@ class DashboardTests(unittest.TestCase):
 
     def test_dashboard_is_self_contained_and_refreshes(self):
         self.assertIn("Codex 用量与路由面板", DASHBOARD_HTML)
-        self.assertIn("fetch('api/routes?limit=1000'", DASHBOARD_HTML)
+        self.assertIn("fetch(`api/routes?${query}`", DASHBOARD_HTML)
         self.assertNotIn("fetch('/api/routes", DASHBOARD_HTML)
         self.assertIn("setInterval(load,3000)", DASHBOARD_HTML)
         self.assertNotIn("https://", DASHBOARD_HTML)
