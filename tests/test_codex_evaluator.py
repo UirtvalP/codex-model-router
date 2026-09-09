@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -9,15 +10,22 @@ from unittest.mock import patch
 
 from codex_model_router import cli as cli_module
 from codex_model_router.router import (
+    CODEX_EVALUATOR_FAST,
     CODEX_EVALUATOR_GUARD,
+    CODEX_EVALUATOR_EFFORT,
     CODEX_EVALUATOR_MODEL,
+    CODEX_MODEL_ROUTER_CONFIG,
     FALLBACK_MODELS,
     ModelCatalog,
     RouteChoice,
     _choice_from_payload,
+    _evaluator_observability,
     append_decision_log,
     apply_policy,
     build_classifier_command,
+    build_codex_command,
+    model_fast_setting,
+    load_evaluator_config,
     classifier_environment,
     classify_with_codex,
     route_task,
@@ -73,7 +81,59 @@ class SuccessfulProcess:
 
 
 class CodexEvaluatorTests(unittest.TestCase):
-    def test_classifier_command_uses_fixed_isolated_spark_evaluator(self):
+    def test_model_speed_policy_and_execution_commands(self):
+        payload = {"model_speed": {"default": True, "sol": False, "astra": False}}
+        self.config_path.write_text(json.dumps(payload))
+        for model, expected in [("gpt-5.6-luna", True), ("gpt-5.6-terra", True),
+                                ("gpt-5.6-sol", False), ("gpt-6-astra", False),
+                                ("gpt-5.3-codex-spark", True)]:
+            self.assertEqual(model_fast_setting(model, payload), expected)
+            decision = route_task("Reply hello", catalog(), heuristic_only=True, use_feedback=False)
+            decision.model = model
+            for resume in (None, "test-session"):
+                command = build_codex_command("codex", decision, resume=resume)
+                self.assertIn('service_tier="{0}"'.format("fast" if expected else "default"), command)
+                index = command.index("fast_mode")
+                self.assertEqual(command[index - 1], "--enable" if expected else "--disable")
+        self.assertTrue(load_evaluator_config().fast)
+        self.config_path.write_text("{")
+        command = build_codex_command("codex", decision)
+        self.assertIn('service_tier="default"', command)
+        payload["model_speed"]["gpt-5.6-sol"] = True
+        self.assertTrue(model_fast_setting("gpt-5.6-sol", payload))
+        self.assertIsNone(model_fast_setting("gpt-5.6-sol", {}))
+        with self.assertRaises(ValueError):
+            model_fast_setting("gpt-5.6-sol", {"model_speed": {"sol": "false"}})
+
+    def test_skill_budget_notice_is_not_a_disabled_tool(self):
+        notice = {"type": "item.completed", "item": {
+            "type": "error", "message": "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill."
+        }}
+        completed = {"type": "turn.completed", "usage": {"input_tokens": 10}}
+        self.assertEqual(
+            _evaluator_observability(json.dumps(notice) + "\n" + json.dumps(completed)),
+            (None, {"input_tokens": 10}),
+        )
+        for item in [
+            {"type": "error", "message": "Unexpected evaluator failure"},
+            {"type": "command_execution", "command": "pwd"},
+        ]:
+            with self.assertRaises(RuntimeError):
+                _evaluator_observability(json.dumps({"type": "item.completed", "item": item}))
+
+
+    def setUp(self):
+        self.config_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.config_dir.cleanup)
+        self.config_path = Path(self.config_dir.name) / "config.json"
+        config_environment = patch.dict(
+            os.environ,
+            {CODEX_MODEL_ROUTER_CONFIG: str(self.config_path)},
+        )
+        config_environment.start()
+        self.addCleanup(config_environment.stop)
+
+    def test_classifier_command_uses_default_isolated_spark_evaluator(self):
         command = build_classifier_command(
             "codex", CODEX_EVALUATOR_MODEL, "empty", "schema.json", "output.json"
         )
@@ -81,8 +141,9 @@ class CodexEvaluatorTests(unittest.TestCase):
         self.assertIn(CODEX_EVALUATOR_MODEL, command)
         self.assertIn('model_reasoning_effort="low"', command)
         self.assertEqual(CODEX_EVALUATOR_MODEL, "gpt-5.3-codex-spark")
-        self.assertNotIn('service_tier="fast"', command)
+        self.assertIn('service_tier="default"', command)
         self.assertNotIn("--enable fast_mode", joined)
+        self.assertIn("--disable fast_mode", joined)
         for feature in (
             "shell_tool",
             "multi_agent",
@@ -101,6 +162,23 @@ class CodexEvaluatorTests(unittest.TestCase):
         self.assertIn("--ignore-rules", command)
         self.assertIn("--strict-config", command)
         self.assertIn('forced_login_method="chatgpt"', command)
+
+    def test_classifier_command_applies_configured_effort_and_fast(self):
+        command = build_classifier_command(
+            "codex",
+            "gpt-5.6-terra",
+            "empty",
+            "schema.json",
+            "output.json",
+            evaluator_reasoning_effort="high",
+            evaluator_fast=True,
+        )
+        joined = " ".join(command)
+        self.assertIn("gpt-5.6-terra", command)
+        self.assertIn('model_reasoning_effort="high"', command)
+        self.assertIn('service_tier="fast"', command)
+        self.assertIn("--enable fast_mode", joined)
+        self.assertNotIn("--disable fast_mode", joined)
 
     def test_classifier_environment_sets_recursion_guard_and_strips_keys(self):
         environment = classifier_environment(
@@ -139,10 +217,61 @@ class CodexEvaluatorTests(unittest.TestCase):
         self.assertEqual((selected.model, selected.effort), ("gpt-5.6-luna", "low"))
         self.assertEqual(selected.source, "codex-evaluator")
         self.assertEqual(selected.evaluator_model, CODEX_EVALUATOR_MODEL)
+        self.assertEqual(selected.evaluator_reasoning_effort, CODEX_EVALUATOR_EFFORT)
+        self.assertEqual(selected.evaluator_fast, CODEX_EVALUATOR_FAST)
         self.assertEqual(selected.evaluator_thread_id, "thread-1")
         self.assertEqual(selected.evaluator_usage["input_tokens"], 120)
         self.assertEqual(selected.evaluator_reason, valid_payload()["reason"])
         self.assertGreaterEqual(selected.classifier_ms, 0)
+
+    def test_direct_classify_reloads_config_between_calls(self):
+        stdout = json.dumps({"type": "thread.started", "thread_id": "thread-1"})
+        commands = []
+
+        def process_factory(command, **kwargs):
+            commands.append(command)
+            return SuccessfulProcess(command, valid_payload(), stdout, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            with patch.dict(os.environ, {CODEX_MODEL_ROUTER_CONFIG: str(config_path)}), patch(
+                "codex_model_router.router.subprocess.Popen", side_effect=process_factory
+            ):
+                config_path.write_text(
+                    json.dumps({"evaluator": {"model": "gpt-5.6-terra", "reasoning_effort": "high", "fast": True}}),
+                    encoding="utf-8",
+                )
+                first = classify_with_codex(
+                    "Classify this", catalog(), "agent", codex_executable="codex"
+                )
+                config_path.write_text(
+                    json.dumps({"evaluator": {"model": "gpt-5.6-sol", "reasoning_effort": "medium", "fast": False}}),
+                    encoding="utf-8",
+                )
+                second = classify_with_codex(
+                    "Classify this", catalog(), "agent", codex_executable="codex"
+                )
+        self.assertEqual((first.evaluator_model, first.evaluator_reasoning_effort, first.evaluator_fast), ("gpt-5.6-terra", "high", True))
+        self.assertEqual((second.evaluator_model, second.evaluator_reasoning_effort, second.evaluator_fast), ("gpt-5.6-sol", "medium", False))
+        self.assertIn('service_tier="fast"', commands[0])
+        self.assertIn("--enable", commands[0])
+        self.assertIn('service_tier="default"', commands[1])
+        self.assertIn("--disable", commands[1])
+
+    def test_malformed_config_falls_back_with_default_evaluator_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text('{"evaluator": {"fast": "true"}}', encoding="utf-8")
+            with patch.dict(os.environ, {CODEX_MODEL_ROUTER_CONFIG: str(config_path)}), patch(
+                "codex_model_router.router.classify_with_codex"
+            ) as evaluator:
+                decision = route_task("Implement a helper", catalog=catalog())
+        evaluator.assert_not_called()
+        self.assertEqual(decision.source, "codex-evaluator-fallback")
+        self.assertEqual(decision.evaluator_model, CODEX_EVALUATOR_MODEL)
+        self.assertEqual(decision.evaluator_reasoning_effort, CODEX_EVALUATOR_EFFORT)
+        self.assertEqual(decision.evaluator_fast, CODEX_EVALUATOR_FAST)
+        self.assertIn("config fast must be boolean", decision.evaluator_error)
 
     def test_strict_payload_rejects_string_boolean_and_nonfinite_confidence(self):
         malformed = valid_payload(parallelizable="false")
@@ -259,6 +388,8 @@ class CodexEvaluatorTests(unittest.TestCase):
             source="codex-evaluator",
             classifier_ms=123,
             evaluator_model=CODEX_EVALUATOR_MODEL,
+            evaluator_reasoning_effort=CODEX_EVALUATOR_EFFORT,
+            evaluator_fast=CODEX_EVALUATOR_FAST,
             evaluator_reason="private-token-test-123",
             evaluator_thread_id="thread-1",
             evaluator_usage={"input_tokens": 120, "output_tokens": 40},
@@ -269,6 +400,8 @@ class CodexEvaluatorTests(unittest.TestCase):
             append_decision_log("Compute 2+2", decision, "route_only", log_path=path)
             record = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(record["evaluator"]["model"], CODEX_EVALUATOR_MODEL)
+        self.assertEqual(record["evaluator"]["reasoning_effort"], CODEX_EVALUATOR_EFFORT)
+        self.assertFalse(record["evaluator"]["fast"])
         self.assertEqual(record["evaluator"]["request_ms"], 123)
         self.assertEqual(record["evaluator"]["summary"], "type=answer; risk=low; confidence=0.90")
         self.assertNotIn("reason", record["evaluator"])

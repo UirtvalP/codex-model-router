@@ -24,10 +24,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-ROUTER_VERSION = "0.8.2"
+ROUTER_VERSION = "0.9.0"
 PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
 CODEX_EVALUATOR_MODEL = "gpt-5.3-codex-spark"
 CODEX_EVALUATOR_EFFORT = "low"
+CODEX_EVALUATOR_FAST = False
+CODEX_MODEL_ROUTER_CONFIG = "CODEX_MODEL_ROUTER_CONFIG"
 CODEX_EVALUATOR_GUARD = "CODEX_MODEL_ROUTER_EVALUATOR"
 CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS = 30.0
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max", "ultra")
@@ -100,6 +102,15 @@ class ModelCatalog:
         return list(dict.fromkeys(preferred + astra))
 
 
+@dataclass(frozen=True)
+class EvaluatorConfig:
+    """Runtime configuration for the isolated Codex evaluator."""
+
+    model: str = CODEX_EVALUATOR_MODEL
+    reasoning_effort: str = CODEX_EVALUATOR_EFFORT
+    fast: bool = CODEX_EVALUATOR_FAST
+
+
 @dataclass
 class RouteChoice:
     """Untrusted recommendation from the classifier or local heuristics."""
@@ -116,6 +127,8 @@ class RouteChoice:
     source: str = "heuristic"
     classifier_ms: Optional[int] = None
     evaluator_model: Optional[str] = None
+    evaluator_reasoning_effort: Optional[str] = None
+    evaluator_fast: Optional[bool] = None
     evaluator_reason: Optional[str] = None
     evaluator_thread_id: Optional[str] = None
     evaluator_usage: Dict[str, int] = field(default_factory=dict)
@@ -142,6 +155,8 @@ class RoutingDecision:
     safety: Dict[str, bool]
     overrides: List[str] = field(default_factory=list)
     evaluator_model: Optional[str] = None
+    evaluator_reasoning_effort: Optional[str] = None
+    evaluator_fast: Optional[bool] = None
     evaluator_reason: Optional[str] = None
     evaluator_thread_id: Optional[str] = None
     evaluator_usage: Dict[str, int] = field(default_factory=dict)
@@ -220,6 +235,57 @@ def router_data_directory() -> Path:
 
 def default_catalog_cache_path() -> Path:
     return router_data_directory() / "catalog.json"
+
+
+def default_evaluator_config_path() -> Path:
+    configured_path = os.environ.get(CODEX_MODEL_ROUTER_CONFIG)
+    if configured_path:
+        return Path(configured_path)
+    return router_data_directory() / "config.json"
+
+
+def _load_router_config(path: Optional[Path] = None) -> Mapping[str, Any]:
+    config_path = path or default_evaluator_config_path()
+    if not config_path.exists():
+        return {}
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("Codex evaluator config must be a JSON object")
+    return payload
+
+
+def model_fast_setting(model: str, payload: Mapping[str, Any]) -> Optional[bool]:
+    """Resolve exact model, family, then default speed policy."""
+    speeds = payload.get("model_speed", {})
+    if not isinstance(speeds, Mapping):
+        raise ValueError("model_speed must be an object")
+    if any(not isinstance(key, str) or not isinstance(value, bool)
+           for key, value in speeds.items()):
+        raise ValueError("model_speed values must be boolean")
+    for key in (model, _model_family(model), "default"):
+        if key in speeds:
+            return speeds[key]
+    return None
+
+
+def load_evaluator_config(path: Optional[Path] = None) -> EvaluatorConfig:
+    """Load and validate evaluator configuration for one routing invocation."""
+    payload = _load_router_config(path)
+    evaluator = payload.get("evaluator", {})
+    if not isinstance(evaluator, Mapping):
+        raise ValueError("Codex evaluator config evaluator must be an object")
+    model = evaluator.get("model", CODEX_EVALUATOR_MODEL)
+    effort = evaluator.get("reasoning_effort", CODEX_EVALUATOR_EFFORT)
+    fast = evaluator.get("fast", CODEX_EVALUATOR_FAST)
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("Codex evaluator config model must be a nonempty string")
+    if not isinstance(effort, str) or effort not in EFFORT_ORDER:
+        raise ValueError("Codex evaluator config reasoning_effort is invalid")
+    if not isinstance(fast, bool):
+        raise ValueError("Codex evaluator config fast must be boolean")
+    configured_fast = model_fast_setting(model.strip(), payload)
+    return EvaluatorConfig(model=model.strip(), reasoning_effort=effort,
+                           fast=fast if configured_fast is None else configured_fast)
 
 
 def _read_catalog_cache(path: Path) -> Optional[ModelCatalog]:
@@ -576,7 +642,11 @@ def build_classifier_command(
     working_directory: str,
     schema_path: str,
     output_path: str,
+    evaluator_reasoning_effort: str = CODEX_EVALUATOR_EFFORT,
+    evaluator_fast: bool = CODEX_EVALUATOR_FAST,
 ) -> List[str]:
+    fast_mode = "--enable" if evaluator_fast else "--disable"
+    service_tier = "fast" if evaluator_fast else "default"
     return [
         codex_executable,
         "exec",
@@ -607,12 +677,16 @@ def build_classifier_command(
         "memories",
         "--disable",
         "skill_search",
+        fast_mode,
+        "fast_mode",
         "-C",
         working_directory,
         "-m",
         evaluator_model,
         "-c",
-        'model_reasoning_effort="low"',
+        'model_reasoning_effort="{0}"'.format(evaluator_reasoning_effort),
+        "-c",
+        'service_tier="{0}"'.format(service_tier),
         "-c",
         'model_verbosity="low"',
         "-c",
@@ -746,6 +820,15 @@ def _evaluator_observability(stdout: str) -> Tuple[Optional[str], Dict[str, int]
         if event.get("type") in ("item.started", "item.completed"):
             item = event.get("item")
             item_type = item.get("type") if isinstance(item, Mapping) else None
+            # Codex 将技能预算提示编码为 error，但这不是工具调用或评估失败。
+            if (
+                item_type == "error"
+                and isinstance(item.get("message"), str)
+                and item["message"].startswith(
+                    "Skill descriptions were shortened to fit the skills context budget."
+                )
+            ):
+                continue
             if item_type not in (None, "agent_message", "reasoning"):
                 raise RuntimeError(
                     "Codex evaluator attempted disabled tool item: {0}".format(item_type)
@@ -759,11 +842,13 @@ def classify_with_codex(
     surface: str,
     codex_executable: Optional[str] = None,
     timeout_seconds: float = CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS,
+    evaluator_config: Optional[EvaluatorConfig] = None,
 ) -> RouteChoice:
     """Classify one task with an isolated, ChatGPT-authenticated Codex process."""
 
     if os.environ.get(CODEX_EVALUATOR_GUARD):
         raise RuntimeError("recursive Codex evaluator invocation blocked")
+    active_evaluator_config = evaluator_config or load_evaluator_config()
     executable = codex_executable or find_codex_executable()
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="codex-router-evaluator-") as temp_dir:
@@ -776,10 +861,12 @@ def classify_with_codex(
         )
         command = build_classifier_command(
             executable,
-            CODEX_EVALUATOR_MODEL,
+            active_evaluator_config.model,
             temp_dir,
             str(schema_path),
             str(output_path),
+            evaluator_reasoning_effort=active_evaluator_config.reasoning_effort,
+            evaluator_fast=active_evaluator_config.fast,
         )
         popen_kwargs: Dict[str, Any] = {
             "stdin": subprocess.PIPE,
@@ -830,7 +917,9 @@ def classify_with_codex(
             raise ValueError("Codex evaluator selected an unavailable model")
         if not catalog.supports(choice.model, choice.effort):
             raise ValueError("Codex evaluator selected an unsupported effort")
-        choice.evaluator_model = CODEX_EVALUATOR_MODEL
+        choice.evaluator_model = active_evaluator_config.model
+        choice.evaluator_reasoning_effort = active_evaluator_config.reasoning_effort
+        choice.evaluator_fast = active_evaluator_config.fast
         choice.evaluator_reason = choice.reason
         choice.evaluator_thread_id = thread_id
         choice.evaluator_usage = usage
@@ -966,6 +1055,8 @@ def apply_policy(
         safety=safety,
         overrides=overrides,
         evaluator_model=choice.evaluator_model,
+        evaluator_reasoning_effort=choice.evaluator_reasoning_effort,
+        evaluator_fast=choice.evaluator_fast,
         evaluator_reason=choice.evaluator_reason,
         evaluator_thread_id=choice.evaluator_thread_id,
         evaluator_usage=dict(choice.evaluator_usage),
@@ -991,13 +1082,16 @@ def route_task(
         choice = classify_heuristically(task, active_catalog)
     else:
         evaluator_started = time.perf_counter()
+        evaluator_config = EvaluatorConfig()
         try:
+            evaluator_config = load_evaluator_config()
             choice = classify_with_codex(
                 task,
                 active_catalog,
                 surface,
                 codex_executable=codex_executable,
                 timeout_seconds=classifier_timeout_seconds,
+                evaluator_config=evaluator_config,
             )
         except (
             KeyError,
@@ -1021,7 +1115,9 @@ def route_task(
                 safety=scan_safety(task),
                 source="codex-evaluator-fallback",
                 classifier_ms=int((time.perf_counter() - evaluator_started) * 1000),
-                evaluator_model=CODEX_EVALUATOR_MODEL,
+                evaluator_model=evaluator_config.model,
+                evaluator_reasoning_effort=evaluator_config.reasoning_effort,
+                evaluator_fast=evaluator_config.fast,
                 evaluator_reason="Codex evaluator did not return a usable route.",
                 evaluator_error=str(exc)[:240],
             )
@@ -1063,6 +1159,15 @@ def build_codex_command(
         raise ValueError("Choose either resume or resume_last")
     reasoning_override = 'model_reasoning_effort="{0}"'.format(decision.effort)
     resolved_cwd = _normalized_cwd(cwd) if cwd else None
+    try:
+        fast = model_fast_setting(decision.model, _load_router_config())
+    except (OSError, ValueError):
+        # 配置损坏时仍允许执行安全回退，避免再次读取配置中断任务。
+        fast = False
+    speed_args = [] if fast is None else [
+        "--enable" if fast else "--disable", "fast_mode",
+        "-c", 'service_tier="{0}"'.format("fast" if fast else "default"),
+    ]
 
     if resume or resume_last:
         command = [
@@ -1074,6 +1179,7 @@ def build_codex_command(
             "-c",
             reasoning_override,
         ]
+        command.extend(speed_args)
         if sandbox:
             command.extend(["-c", 'sandbox_mode="{0}"'.format(sandbox)])
         if json_events:
@@ -1093,6 +1199,7 @@ def build_codex_command(
         "-c",
         reasoning_override,
     ]
+    command.extend(speed_args)
     if resolved_cwd:
         command.extend(["-C", resolved_cwd])
     if sandbox:
@@ -1153,12 +1260,14 @@ def append_decision_log(
     fallback_error = decision.evaluator_error
     if decision.source.startswith("codex-evaluator"):
         display = (
-            "{0} | source {1} | evaluator {2}/low ({3} ms) -> Codex {4} ({5}) | "
-            "fallback {6}"
+            "{0} | source {1} | evaluator {2}/{3} fast={4} ({5} ms) -> Codex {6} ({7}) | "
+            "fallback {8}"
         ).format(
             outcome,
             decision.source,
             decision.evaluator_model or CODEX_EVALUATOR_MODEL,
+            decision.evaluator_reasoning_effort or CODEX_EVALUATOR_EFFORT,
+            decision.evaluator_fast if decision.evaluator_fast is not None else CODEX_EVALUATOR_FAST,
             decision.classifier_ms if decision.classifier_ms is not None else "none",
             decision.model,
             decision.effort,
@@ -1188,7 +1297,8 @@ def append_decision_log(
         "codex_session_id": codex_session_id,
         "evaluator": {
             "model": decision.evaluator_model,
-            "reasoning_effort": CODEX_EVALUATOR_EFFORT if decision.evaluator_model else None,
+            "reasoning_effort": decision.evaluator_reasoning_effort,
+            "fast": decision.evaluator_fast,
             "summary": (
                 "type={0}; risk={1}; confidence={2:.2f}".format(
                     decision.task_type if decision.task_type in TASK_TYPES else "other",
