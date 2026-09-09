@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 import urllib.error
 import urllib.parse
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Mapping, Optional
 
 from .router import default_log_path
+from .usage import build_usage_payload
 
 
 DASHBOARD_HOST = "127.0.0.1"
@@ -179,7 +181,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Codex 路由面板</title>
+  <title>Codex 用量与路由面板</title>
   <style>
     :root{--bg:#080b12;--panel:#111722;--panel2:#151d2b;--line:#263247;--text:#edf3ff;--muted:#91a0b8;--accent:#75a7ff;--luna:#65d6ad;--terra:#65b9ff;--sol:#b58cff;--astra:#ffbd66;--bad:#ff6f7d;--good:#66dda0}
     *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at 15% 0,#18233a 0,transparent 28%),var(--bg);color:var(--text);font:14px/1.45 Inter,Segoe UI,Arial,sans-serif}
@@ -188,6 +190,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     button,select,input{font:inherit;color:var(--text);background:#0d1420;border:1px solid var(--line);border-radius:9px;padding:9px 11px;outline:none}button{cursor:pointer}button:hover{border-color:var(--accent)}
     .cards{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:14px;margin-bottom:18px}.card,.panel{background:linear-gradient(145deg,#141c2a,#0f1520);border:1px solid var(--line);border-radius:15px;box-shadow:0 16px 40px #0003}.card{padding:18px}.card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.card .value{font-size:28px;font-weight:730;margin-top:8px}.card .hint{font-size:12px;color:var(--muted);margin-top:3px}
     .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}.panel{padding:18px}.panel h2{font-size:15px;margin:0 0 16px}.bars{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:66px 1fr 110px;align-items:center;gap:10px}.bar-track{height:9px;border-radius:10px;background:#090d14;overflow:hidden}.bar-fill{height:100%;border-radius:10px}.bar-count{text-align:right;color:var(--muted)}
+    .grid>article{min-width:0}
     .filters{display:grid;grid-template-columns:minmax(220px,1fr) repeat(4,150px) auto;gap:10px;margin-bottom:13px}.table-panel{padding:0;overflow:hidden}.table-head{padding:18px 18px 0}.scroll{overflow:auto;max-height:56vh}table{width:100%;border-collapse:collapse;min-width:1100px}th{position:sticky;top:0;background:#111925;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;text-align:left;padding:11px 13px;border-bottom:1px solid var(--line);z-index:1}td{padding:12px 13px;border-bottom:1px solid #202a3a;vertical-align:top}tbody tr:hover{background:#172131}.task{max-width:280px}.task strong{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.small{font-size:12px;color:var(--muted)}
     .pill{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);background:#0b111b;border-radius:99px;padding:4px 8px;font-size:12px;white-space:nowrap}.family-luna{color:var(--luna)}.family-terra{color:var(--terra)}.family-sol{color:var(--sol)}.family-astra{color:var(--astra)}.bad{color:var(--bad)}.good{color:var(--good)}
     .empty{padding:50px;text-align:center;color:var(--muted)}.footer{display:flex;justify-content:space-between;gap:14px;margin-top:12px;color:var(--muted);font-size:12px;word-break:break-all}.error{margin:0 0 14px;background:#341720;border:1px solid #71313d;color:#ffadb5;padding:12px;border-radius:10px;display:none}
@@ -196,8 +199,21 @@ DASHBOARD_HTML = r"""<!doctype html>
 </head>
 <body>
 <main class="shell">
-  <header class="top"><div class="brand"><h1>Codex 路由面板</h1><div class="subtitle">Codex 评估器选择执行模型；历史 Not Diamond 记录保留</div></div><div class="status"><span class="dot" id="dot"></span><span id="status">正在连接</span><button id="refresh">立即刷新</button></div></header>
+  <header class="top"><div class="brand"><h1>Codex 用量与路由面板</h1><div class="subtitle">本机任务与子 agent 的 Token 用量，以及模型路由记录</div></div><div class="status"><span class="dot" id="dot"></span><span id="status">正在连接</span><button id="refresh">立即刷新</button></div></header>
   <div id="error" class="error"></div>
+  <section class="panel" style="margin-bottom:20px">
+    <h2>本机 Codex · Token 用量</h2>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+      <button data-period="today">今天</button><button data-period="week">最近 7 天</button><button data-period="all">全部记录</button>
+      <label>从 <input type="date" id="usageStart"></label><label>至 <input type="date" id="usageEnd"></label><button id="usageApply">查询</button>
+    </div>
+    <div id="usageStatus" class="muted" role="status">正在读取本机会话用量…</div>
+    <div class="cards" id="usageCards" style="margin-top:16px"></div>
+    <div class="grid"><article><h2>按模型</h2><div id="usageModels" class="scroll"></div></article><article><h2>按日期</h2><div id="usageDays" class="scroll"></div></article></div>
+    <details><summary>按任务查看（Session ID）</summary><div id="usageSessions" class="scroll" style="margin-top:12px"></div></details>
+    <p class="small">缓存命中包含在输入中，推理包含在输出中，不重复相加。仅统计本机保留的日志，不等同于账号额度或费用。</p>
+  </section>
+  <h2 style="font-size:18px">模型路由</h2>
   <section class="cards">
     <article class="card"><div class="label">全部路由</div><div class="value" id="total">—</div><div class="hint" id="shown">读取日志中</div></article>
     <article class="card"><div class="label">最近 24 小时</div><div class="value" id="day">—</div><div class="hint">每次 spawn 独立计数</div></article>
@@ -225,6 +241,13 @@ renderModelDistributions(s.models_by_source); optionValues('family',payload.rout
 function renderRows(){const q=$('search').value.trim().toLowerCase(), family=$('family').value, source=$('source').value, cache=$('cache').value, fallback=$('fallback').value; const routes=payload.routes.filter(r=>{const hay=[r.task,r.task_summary,r.selector_model,r.reason,r.model,r.session_id,r.decision_id].join(' ').toLowerCase(); return(!q||hay.includes(q))&&(!family||r.family===family)&&(!source||r.source===source)&&(!cache||(cache==='hit')===r.cache_hit)&&(!fallback||(fallback==='yes')===r.fallback_used)}); $('empty').hidden=routes.length>0; $('rows').innerHTML=routes.map(r=>`<tr><td class="task"><strong title="${esc(r.task)}">${esc(r.task)}</strong><span class="small">${esc(localTime(r.timestamp))}</span></td><td><span class="pill">${esc(r.selector_model)}</span></td><td><span class="pill family-${esc(r.family)}">${esc(r.model)}</span><div class="small">${esc(r.effort)}</div></td><td>${esc(r.source)}</td><td class="${r.cache_hit?'good':''}">${r.cache_hit?`命中 · ${number(r.cache_samples)} 样本`:'实时'}</td><td class="${r.fallback_used?'bad':'good'}" title="${esc(r.fallback_error||'')}">${r.fallback_used?'是':'否'}</td><td>${r.request_ms==null?'—':`${number(r.request_ms)} ms`}</td><td><div class="small">${esc(r.reason)}</div><span class="small" title="${esc(r.session_id)}">${esc(r.session_id==='none'?'—':r.session_id.slice(0,12)+'…')}</span></td><td>${esc(r.rating||r.outcome||'—')}</td></tr>`).join('')}
 async function load(){try{const res=await fetch('api/routes?limit=1000',{cache:'no-store'});if(!res.ok)throw new Error(`HTTP ${res.status}`);payload=await res.json();$('error').style.display='none';$('dot').style.background='var(--good)';$('status').textContent='实时 · 每 3 秒刷新';render()}catch(e){$('error').textContent=`面板读取失败：${e.message}`;$('error').style.display='block';$('dot').style.background='var(--bad)';$('status').textContent='连接异常'}}
 ['search','family','source','cache','fallback'].forEach(id=>$(id).addEventListener(id==='search'?'input':'change',renderRows));$('clear').onclick=()=>{['search','family','source','cache','fallback'].forEach(id=>$(id).value='');renderRows()};$('refresh').onclick=load;load();setInterval(load,3000);
+
+let usageSeq=0;
+function usageTable(rows,key){return `<table style="min-width:550px"><thead><tr><th>${key==='model'?'模型':key==='date'?'日期':'任务 / Session'}</th><th>输入</th><th>缓存命中</th><th>输出</th><th>命中率</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r[key]||'unknown')}</td><td>${number(r.input_tokens)}</td><td>${number(r.cached_input_tokens)}</td><td>${number(r.output_tokens)}</td><td>${pct((r.cache_hit_rate||0)*100)}</td></tr>`).join('')||'<tr><td colspan="5">所选时间内没有记录</td></tr>'}</tbody></table>`}
+async function loadUsage(){const seq=++usageSeq;const q=new URLSearchParams({start:$('usageStart').value,end:$('usageEnd').value});$('usageStatus').textContent='正在统计本地日志…';try{const res=await fetch(`api/usage?${q}`,{cache:'no-store'});if(!res.ok)throw new Error(`HTTP ${res.status}`);const d=await res.json();if(seq!==usageSeq)return;const s=d.summary||{};const cards=[['输入 Token',s.input_tokens,'含缓存命中输入'],['缓存命中',s.cached_input_tokens,`命中率 ${pct((s.cache_hit_rate||0)*100)}`],['未缓存输入',s.uncached_input_tokens,'输入减去缓存命中'],['输出 Token',s.output_tokens,'含推理输出'],['推理 Token',s.reasoning_output_tokens,'输出中的推理部分']];$('usageCards').innerHTML=cards.map(([label,value,hint])=>`<article class="card"><div class="label">${label}</div><div class="value" style="font-size:23px">${number(value)}</div><div class="hint">${hint}</div></article>`).join('');$('usageModels').innerHTML=usageTable(d.by_model||[],'model');$('usageDays').innerHTML=usageTable(d.by_day||[],'date');$('usageSessions').innerHTML=usageTable(d.by_session||[],'session_id');$('usageStatus').textContent=`输入 + 输出：${number(s.total_tokens)} · 缓存写入：${number(s.cache_write_input_tokens)} · ${d.coverage?.note||'按请求增量统计，已去除重复记录'}${d.coverage?.errors? ' · 存在无法读取或解析的记录，请留意统计可能不完整':''}`;}catch(e){if(seq===usageSeq)$('usageStatus').textContent=`用量读取失败：${e.message}`}}
+function localDate(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
+function usagePeriod(p){let today=new Date(),start=new Date();if(p==='week')start.setDate(start.getDate()-6);$('usageStart').value=p==='all'?'':localDate(start);$('usageEnd').value=p==='all'?'':localDate(today);loadUsage()}
+document.querySelectorAll('[data-period]').forEach(b=>b.onclick=()=>usagePeriod(b.dataset.period));$('usageApply').onclick=loadUsage;usagePeriod('today');setInterval(loadUsage,30000);
 </script></body></html>"""
 
 
@@ -249,6 +272,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/healthz":
             body = json.dumps({"name": DASHBOARD_NAME, "ok": True}).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
+            return
+        if parsed.path == "/api/usage":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                payload = build_usage_payload(
+                    Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex"),
+                    self.log_path,
+                    start=query.get("start", [""])[0], end=query.get("end", [""])[0],
+                )
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            except ValueError:
+                self._send(400, "application/json; charset=utf-8", b'{"error":"Invalid date range"}')
+            except OSError:
+                self._send(500, "application/json; charset=utf-8", b'{"error":"Cannot read local usage logs"}')
             return
         if parsed.path == "/api/routes":
             query = urllib.parse.parse_qs(parsed.query)
