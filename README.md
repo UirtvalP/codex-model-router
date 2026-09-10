@@ -247,3 +247,29 @@ CI covers Python 3.9 and 3.14 on Windows and Linux.
 ## License
 
 No open-source license has been selected for this MVP yet.
+
+## Cursor adapter (experimental)
+
+The separate `python -m codex_model_router.cursor_router` adapter uses Composer 2.5
+to choose from an explicit list of Composer and Cursor Grok model IDs. It does not use
+Codex execution models or credentials. Confirm IDs with `agent models` after
+`agent login`. Configuration is read from `~/.cursor/model-router/config.json`:
+
+```json
+{
+  "enabled": true,
+  "evaluator_model": "composer-2.5",
+  "agent_executable": "/absolute/path/to/agent",
+  "candidates": ["composer-2.5"],
+  "timeout_seconds": 60
+}
+```
+
+Add only verified Composer or Cursor Grok IDs to `candidates`; no model-name mapping is
+performed. Run the installed module with `--install` to merge user hooks with
+a backup. `preToolUse` rewrites only new `Task` calls; resumed agents retain
+their model and context. Evaluation errors preserve the original Task input.
+`subagentStart` records the actual model and compares it with the requested one
+in `~/.cursor/model-router/decisions.jsonl`. A routing decision alone is not
+proof that Cursor honored the model override. Desktop and CLI behavior must be
+verified independently. Disable with `"enabled": false`.
