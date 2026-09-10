@@ -1,5 +1,7 @@
 import json
 import os
+import sys
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -117,6 +119,7 @@ class CursorRouterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             config = enabled_config()
+            config["agent_executable"] = sys.executable
             config["candidates"] = ["composer-2.5", "gpt-5.6-sol-high"]
             path.write_text(json.dumps(config), encoding="utf-8")
             with self.assertRaises(ConfigurationError):
@@ -154,7 +157,8 @@ class CursorRouterTests(unittest.TestCase):
             install_hooks(path, "/tmp/Cursor Router/python3")
             payload = json.loads(path.read_text(encoding="utf-8"))
         command = payload["hooks"]["preToolUse"][0]["command"]
-        self.assertIn("'/tmp/Cursor Router/python3' -I", command)
+        self.assertEqual(shlex.split(command)[0], os.path.abspath("/tmp/Cursor Router/python3"))
+        self.assertIn(" -I -m codex_model_router.cursor_router", command)
 
     def test_default_timeout_and_hook_timeout_are_deliberate(self):
         self.assertEqual(DEFAULT_TIMEOUT_SECONDS, 60)

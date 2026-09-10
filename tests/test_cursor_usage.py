@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime
 
 from codex_model_router.cursor_usage import build_cursor_payload
 
@@ -37,19 +38,21 @@ class CursorUsageTests(unittest.TestCase):
 
     def test_routes_pair_then_filter_with_proposal_timestamp(self):
         self.routes.write_text("\n".join(json.dumps(row) for row in (
-            {"id": "a", "timestamp": "2026-09-09T23:59:59Z", "original_model": "old", "requested_model": "new", "actual_model": None, "reason": "policy"},
-            {"id": "a", "timestamp": "2026-09-10T00:00:01Z", "actual_model": "new", "reason": "observed"},
-            {"id": "b", "timestamp": "2026-09-10T01:00:00Z", "original_model": "old", "requested_model": "new", "actual_model": None, "reason": "policy"},
-            {"id": "b", "timestamp": "2026-09-10T01:00:01Z", "actual_model": "other"},
+            {"id": "a", "timestamp": datetime.fromisoformat("2026-09-09T23:59:59").astimezone().isoformat(), "original_model": "old", "requested_model": "new", "actual_model": None, "reason": "policy"},
+            {"id": "a", "timestamp": datetime.fromisoformat("2026-09-10T00:00:01").astimezone().isoformat(), "actual_model": "new", "reason": "observed"},
+            {"id": "b", "timestamp": datetime.fromisoformat("2026-09-10T01:00:00").astimezone().isoformat(), "original_model": "old", "requested_model": "new", "actual_model": None, "reason": "policy"},
+            {"id": "b", "timestamp": datetime.fromisoformat("2026-09-10T01:00:01").astimezone().isoformat(), "actual_model": "other"},
         )))
         result = build_cursor_payload(self.root / "unused.db", self.routes, start="2026-09-10", end="2026-09-10", csv_path=self.root / "missing.csv")
-        self.assertEqual([row["id"] for row in result["routes"]], ["b", "a"])
-        self.assertEqual(result["routes"][1]["actual_model"], "new")
-        self.assertEqual(result["route_summary"], {"total": 2, "verified": 2, "matched": 1, "failed": 1, "errors": 0})
+        self.assertEqual([row["id"] for row in result["routes"]], ["b"])
+        previous = build_cursor_payload(self.root / "unused.db", self.routes, start="2026-09-09", end="2026-09-09", csv_path=self.root / "missing.csv")
+        self.assertEqual([row["id"] for row in previous["routes"]], ["a"])
+        self.assertEqual(previous["routes"][0]["actual_model"], "new")
+        self.assertEqual(result["route_summary"], {"total": 1, "verified": 1, "matched": 0, "failed": 1, "errors": 0})
 
     def test_route_error_is_failed_but_unobserved_evaluation_is_not(self):
         self.routes.write_text("\n".join(json.dumps(row) for row in (
-            {"id": "error", "timestamp": "2026-09-10T01:00:00Z", "requested_model": "a", "actual_model": None, "reason": "error: timeout"},
+            {"id": "error", "timestamp": datetime.fromisoformat("2026-09-10T01:00:00").astimezone().isoformat(), "requested_model": "a", "actual_model": None, "reason": "error: timeout"},
             {"id": "pending", "timestamp": "2026-09-10T01:01:00Z", "requested_model": "a", "actual_model": None, "reason": "evaluated by composer"},
         )))
         result = build_cursor_payload(self.root / "unused.db", self.routes, csv_path=self.root / "missing.csv")
