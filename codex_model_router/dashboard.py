@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
+import tempfile
 import json
 import os
 import threading
@@ -18,6 +21,9 @@ from typing import Any, Deque, Dict, List, Mapping, Optional
 
 from .router import default_log_path
 from .usage import build_usage_payload
+from .cursor_dashboard import CURSOR_DASHBOARD_HTML
+from .dashboard_styles import DASHBOARD_CSS
+from .cursor_usage import build_cursor_payload
 
 
 DASHBOARD_HOST = "127.0.0.1"
@@ -197,30 +203,11 @@ DASHBOARD_HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Codex 用量与路由面板</title>
-  <style>
-    :root{--bg:#080b12;--panel:#111722;--panel2:#151d2b;--line:#263247;--text:#edf3ff;--muted:#91a0b8;--accent:#75a7ff;--luna:#65d6ad;--terra:#65b9ff;--sol:#b58cff;--astra:#ffbd66;--bad:#ff6f7d;--good:#66dda0}
-    *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at 15% 0,#18233a 0,transparent 28%),var(--bg);color:var(--text);font:14px/1.45 Inter,Segoe UI,Arial,sans-serif}
-    .shell{max-width:1500px;margin:auto;padding:28px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.brand h1{font-size:26px;margin:0 0 6px;letter-spacing:-.4px}.subtitle,.muted{color:var(--muted)}
-    .status{display:flex;align-items:center;gap:10px;background:#111927cc;border:1px solid var(--line);padding:10px 14px;border-radius:12px}.dot{width:9px;height:9px;border-radius:50%;background:var(--good);box-shadow:0 0 12px var(--good)}
-    button,select,input{font:inherit;color:var(--text);background:#0d1420;border:1px solid var(--line);border-radius:9px;padding:9px 11px;outline:none}button{cursor:pointer}button:hover{border-color:var(--accent)}
-    .cards{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:14px;margin-bottom:18px}.card,.panel{background:linear-gradient(145deg,#141c2a,#0f1520);border:1px solid var(--line);border-radius:15px;box-shadow:0 16px 40px #0003}.card{padding:18px}.card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.card .value{font-size:28px;font-weight:730;margin-top:8px}.card .hint{font-size:12px;color:var(--muted);margin-top:3px}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}.panel{padding:18px}.panel h2{font-size:15px;margin:0 0 16px}.bars{display:grid;gap:12px}.bar-row{display:grid;grid-template-columns:66px 1fr 110px;align-items:center;gap:10px}.bar-track{height:9px;border-radius:10px;background:#090d14;overflow:hidden}.bar-fill{height:100%;border-radius:10px}.bar-count{text-align:right;color:var(--muted)}
-    .grid>article{min-width:0}
-    .token-unit{font-size:12px;font-weight:400;color:var(--muted);margin-left:5px}.chart-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1.5fr);gap:16px;margin:20px 0}.chart-box{border:1px solid var(--line);border-radius:12px;padding:16px;min-width:0}.trend{display:flex;gap:12px;height:215px;align-items:stretch;overflow-x:auto}.trend-col{flex:1;min-width:62px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:8px}.trend-bar{width:65%;max-width:55px;border-radius:5px 5px 0 0;background:var(--accent);min-height:2px}.chart-label{font-size:11px;color:var(--muted);white-space:nowrap}.model-chart-row{display:grid;grid-template-columns:150px 1fr 110px;align-items:center;gap:12px;margin:14px 0}.donut{width:142px;height:142px;border-radius:50%;display:grid;place-items:center;margin:12px auto}.donut-center{width:112px;height:112px;border-radius:50%;background:var(--panel);display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:23px;font-weight:700}.legend{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;font-size:12px;color:var(--muted)}.legend-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px}
-    @media(max-width:1100px){.chart-grid{grid-template-columns:1fr}.chart-grid .panel{height:100%}}
-    @media(max-width:800px){.model-chart-row{grid-template-columns:110px 1fr 95px}}
-    .filters{display:grid;grid-template-columns:minmax(220px,1fr) repeat(4,150px) auto;gap:10px;margin-bottom:13px}.table-panel{padding:0;overflow:hidden}.table-head{padding:18px 18px 0}.scroll{overflow:auto;max-height:56vh}table{width:100%;border-collapse:collapse;min-width:1100px}th{position:sticky;top:0;background:#111925;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;text-align:left;padding:11px 13px;border-bottom:1px solid var(--line);z-index:1}td{padding:12px 13px;border-bottom:1px solid #202a3a;vertical-align:top}tbody tr:hover{background:#172131}.task{max-width:280px}.task strong{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.small{font-size:12px;color:var(--muted)}
-    .pill{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);background:#0b111b;border-radius:99px;padding:4px 8px;font-size:12px;white-space:nowrap}.family-luna{color:var(--luna)}.family-terra{color:var(--terra)}.family-sol{color:var(--sol)}.family-astra{color:var(--astra)}.bad{color:var(--bad)}.good{color:var(--good)}
-    .empty{padding:50px;text-align:center;color:var(--muted)}.footer{display:flex;justify-content:space-between;gap:14px;margin-top:12px;color:var(--muted);font-size:12px;word-break:break-all}.error{margin:0 0 14px;background:#341720;border:1px solid #71313d;color:#ffadb5;padding:12px;border-radius:10px;display:none}
-    @media(max-width:1050px){.cards{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.filters{grid-template-columns:1fr 1fr}.top{flex-direction:column}}@media(max-width:600px){.shell{padding:16px}.cards{grid-template-columns:1fr}.filters{grid-template-columns:1fr}}
-    .shell{max-width:1680px;padding:16px}.top{margin-bottom:14px;align-items:center}.brand h1{font-size:22px}.status{padding:7px 10px}.panel,.chart-box{padding:12px}.panel h2,.chart-box h2{margin-bottom:10px}.cards{gap:8px;margin-bottom:12px;grid-template-columns:repeat(5,minmax(0,1fr))}.card{padding:12px}.card .value{font-size:23px;margin-top:5px}.card .hint{font-size:11px}.card .label{font-size:11px;letter-spacing:0}.chart-grid{gap:10px;margin:12px 0}.trend{height:195px;gap:6px}.trend-col{min-width:48px;gap:5px}.model-chart-row{margin:9px 0}.donut{width:120px;height:120px;margin:8px auto}.donut-center{width:94px;height:94px;font-size:21px}.bar-row{grid-template-columns:54px 1fr 96px;gap:7px}.bars{gap:10px}.grid{gap:10px;margin-bottom:12px}td{padding:8px 10px}th{padding:8px 10px}button,select,input{padding:7px 9px}#usageDayDetail{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 14px}#usageDayDetail strong{grid-column:1/-1}#usageCards .value{font-size:23px!important}#usageCards .token-unit{font-size:10px}
-    @media(min-width:760px) and (max-width:1100px){.chart-grid{grid-template-columns:1fr 1fr}.chart-grid>article:first-child{grid-column:1/-1}.top{flex-direction:row}}
-    @media(max-width:759px){.cards{grid-template-columns:repeat(3,minmax(0,1fr))}.shell{padding:10px}.top{gap:8px}.chart-grid{grid-template-columns:1fr}#usageDayDetail{grid-template-columns:1fr}}
-    @media(max-width:430px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}#usageCards .value{font-size:20px!important}}
-  </style>
+  <style>__SHARED_DASHBOARD_CSS__</style>
 </head>
 <body>
 <main class="shell">
+  <nav class="nav" aria-label="面板切换"><a href="/" class="active" aria-current="page">Codex</a><a href="/cursor">Cursor</a></nav>
   <header class="top"><div class="brand"><h1>Codex 用量与路由面板</h1><div class="subtitle">本机任务与子 agent 的 Token 用量，以及模型路由记录</div></div><div class="status"><span class="dot" id="dot"></span><span id="status">正在连接</span><button id="refresh">立即刷新</button></div></header>
   <div id="error" class="error"></div>
   <section class="panel" style="margin-bottom:20px">
@@ -236,7 +223,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <article class="chart-box" style="margin-bottom:12px"><h2>每日输入缓存命中率</h2><div id="usageCacheTrend" style="overflow-x:auto"></div><div id="usageCacheTrendDetail" class="small" aria-live="polite"></div></article>
     <article class="chart-box" style="margin-bottom:18px"><h2>模型用量对比</h2><div id="usageModelChart"></div></article>
     <details><summary>查看精确数据（单位：Token）</summary><div class="grid" style="margin-top:16px"><article><h2>按模型</h2><div id="usageModels" class="scroll"></div></article><article><h2>按日期</h2><div id="usageDays" class="scroll"></div></article></div></details>
-    <article class="chart-box" style="margin:18px 0"><h2>所选日期 · 用量最高的 3 条会话</h2><div class="small" id="usageTopRange"></div><div id="usageTopSessions"></div></article><details><summary>按对话查看</summary><div id="usageSessions" class="scroll" style="margin-top:12px"></div></details>
+    <article class="chart-box" style="margin:18px 0"><h2>所选日期 · 用量最高的 3 条会话</h2><div class="small" id="usageTopRange"></div><div id="usageTopSessions"></div></article><details><summary>按对话查看详情（单位：Token）</summary><div id="usageSessions" class="scroll" style="margin-top:12px"></div></details>
     <p class="small">缓存命中包含在输入中，推理包含在输出中，不重复相加。仅统计本机保留的日志，不等同于账号额度或费用。</p>
   </section>
   <h2 style="font-size:18px">模型路由</h2>
@@ -296,12 +283,13 @@ detail.textContent=`Y 轴自动缩放 ${axisLabel(axisMin)}–${axisLabel(axisMa
 function renderUsageCharts(){if(!usageData)return;const d=usageData,k=$('usageMetric').value,days=[...(d.by_day||[])].sort((a,b)=>a.date.localeCompare(b.date)),models=[...(d.by_model||[])].sort((a,b)=>(b[k]||0)-(a[k]||0));const max=Math.max(1,...days.map(r=>r[k]||0));$('usageTrend').innerHTML=days.map(r=>{const breakdown=[...(r.models||[])].sort((a,b)=>a.model.localeCompare(b.model));return `<div class="trend-col" role="button" tabindex="0" data-day="${esc(r.date)}" aria-label="查看 ${esc(r.date)} 各模型用量" title="${esc(r.date)}：${number(r[k])} Token"><span class="chart-label">${tokenNumber(r[k])}</span><div class="trend-bar" style="height:${Math.max(0,(r[k]||0)/max)*145}px;display:flex;flex-direction:column-reverse;overflow:hidden;background:transparent">${breakdown.map(m=>`<div style="height:${r[k]?Math.max(0,(m[k]||0)/r[k])*100:0}%;background:${modelColor(m.model)};flex-shrink:0" title="${esc(m.model)}：${number(m[k])} Token"></div>`).join('')}</div><span class="chart-label">${esc(r.date.slice(5))}</span></div>`}).join('')||'<span class="muted">所选时间内没有记录</span>';$('usageTrendLegend').innerHTML=[...models].sort((a,b)=>a.model.localeCompare(b.model)).map(m=>`<span><i class="legend-dot" style="background:${modelColor(m.model)}"></i>${esc(m.model)}</span>`).join('');$('usageTrend').querySelectorAll('[data-day]').forEach(el=>{el.onclick=()=>showUsageDay(el.dataset.day);el.onmouseenter=()=>showUsageDay(el.dataset.day);el.onfocus=()=>showUsageDay(el.dataset.day);el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showUsageDay(el.dataset.day)}}});showUsageDay(days.some(r=>r.date===selectedUsageDay)?selectedUsageDay:days.at(-1)?.date);
 renderCacheTrend(days);const modelMax=Math.max(1,...models.map(r=>r[k]||0));$('usageModelChart').innerHTML=models.map(r=>`<div class="model-chart-row" title="${esc(r.model)}：${number(r[k])} Token"><span class="small">${esc(r.model)}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.max(0,(r[k]||0)/modelMax)*100}%;background:${modelColor(r.model)}"></div></div><span class="chart-label" style="text-align:right">${tokenNumber(r[k])} Token</span></div>`).join('')||'<span class="muted">所选时间内没有记录</span>';const a=d.summary||{},rate=Math.max(0,Math.min(100,(a.cache_hit_rate||0)*100));$('usageCacheChart').innerHTML=`<div class="donut" style="background:conic-gradient(var(--luna) ${rate}%,var(--line) 0)" title="缓存命中 ${number(a.cached_input_tokens)} / 输入 ${number(a.input_tokens)} Token"><div class="donut-center">${a.input_tokens?pct(rate):'—'}<span class="small">输入缓存命中率</span></div></div><div class="legend"><span><i class="legend-dot" style="background:var(--luna)"></i>命中 ${tokenNumber(a.cached_input_tokens)}</span><span><i class="legend-dot" style="background:var(--line)"></i>未缓存 ${tokenNumber(a.uncached_input_tokens)}</span></div>`}
 
-function usageTable(rows,key){return `<table style="min-width:550px"><thead><tr><th>${key==='model'?'模型':key==='date'?'日期':'对话标题'}</th><th>输入</th><th>缓存命中</th><th>输出</th><th>命中率</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(key==='session_id'?(r.title||'未命名对话'):(r[key]||'unknown'))}</td><td>${number(r.input_tokens)}</td><td>${number(r.cached_input_tokens)}</td><td>${number(r.output_tokens)}</td><td>${pct((r.cache_hit_rate||0)*100)}</td></tr>`).join('')||'<tr><td colspan="5">所选时间内没有记录</td></tr>'}</tbody></table>`}
-async function loadUsage(){load();const seq=++usageSeq;const q=new URLSearchParams({start:$('usageStart').value,end:$('usageEnd').value});$('usageStatus').textContent='正在统计本地日志…';try{const res=await fetch(`api/usage?${q}`,{cache:'no-store'});if(!res.ok)throw new Error(`HTTP ${res.status}`);const d=await res.json();if(seq!==usageSeq)return;usageData=d;renderUsageCharts();const s=d.summary||{};const cards=[['输入 Token',s.input_tokens,'含缓存命中输入'],['缓存命中',s.cached_input_tokens,`命中率 ${pct((s.cache_hit_rate||0)*100)}`],['未缓存输入',s.uncached_input_tokens,'输入减去缓存命中'],['输出 Token',s.output_tokens,'含推理输出'],['推理 Token',s.reasoning_output_tokens,'输出中的推理部分']];$('usageCards').innerHTML=cards.map(([label,value,hint])=>`<article class="card"><div class="label">${label}</div><div class="value" style="font-size:26px" title="${number(value)} Token">${tokenNumber(value)}<span class="token-unit">Token</span></div><div class="hint">${hint}</div></article>`).join('');$('usageModels').innerHTML=usageTable(d.by_model||[],'model');$('usageDays').innerHTML=usageTable(d.by_day||[],'date');$('usageSessions').innerHTML=usageTable(d.by_session||[],'session_id');$('usageTopRange').textContent=`${$('usageStart').value||'最早记录'} 至 ${$('usageEnd').value||'最新记录'} · 按输入 + 输出排序`;$('usageTopSessions').innerHTML=(d.by_session||[]).slice(0,3).map((r,i)=>`<div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)"><span class="pill">${i+1}</span><div style="flex:1;min-width:0"><strong style="overflow-wrap:anywhere">${esc(r.title||'未命名对话')}</strong><div class="small">输入 ${tokenNumber(r.input_tokens)} · 输出 ${tokenNumber(r.output_tokens)} Token</div></div><span title="${number(r.total_tokens)} Token" style="white-space:nowrap">${tokenNumber(r.total_tokens)} Token</span></div>`).join('')||'<p class="muted">所选日期内没有记录</p>';$('usageStatus').textContent=`输入 + 输出：${tokenNumber(s.total_tokens)} Token · 缓存写入：${tokenNumber(s.cache_write_input_tokens)} Token · ${d.coverage?.note||'按请求增量统计，已去除重复记录'}${d.coverage?.errors? ' · 存在无法读取或解析的记录，请留意统计可能不完整':''}`;}catch(e){if(seq===usageSeq)$('usageStatus').textContent=`用量读取失败：${e.message}`}}
+function usageTable(rows,key){const session=key==='session_id';return `<table style="min-width:${session?950:550}px"><thead><tr><th>${key==='model'?'模型':key==='date'?'日期':'对话标题'}</th><th>输入</th><th>缓存命中</th><th>输出</th>${session?'<th>未缓存输入</th><th>推理</th><th>缓存写入</th>':''}<th>命中率</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(session?(r.title||'未命名对话'):(r[key]||'unknown'))}</td><td>${number(r.input_tokens)}</td><td>${number(r.cached_input_tokens)}</td><td>${number(r.output_tokens)}</td>${session?`<td>${number(r.uncached_input_tokens)}</td><td>${number(r.reasoning_output_tokens)}</td><td>${number(r.cache_write_input_tokens)}</td>`:''}<td>${r.input_tokens?pct((r.cache_hit_rate||0)*100):'—'}</td></tr>`).join('')||`<tr><td colspan="${session?8:5}">所选时间内没有记录</td></tr>`}</tbody></table>`}
+
+async function loadUsage(){load();const seq=++usageSeq;const q=new URLSearchParams({start:$('usageStart').value,end:$('usageEnd').value});$('usageStatus').textContent='正在统计本地日志…';try{const res=await fetch(`api/usage?${q}`,{cache:'no-store'});if(!res.ok)throw new Error(`HTTP ${res.status}`);const d=await res.json();if(seq!==usageSeq)return;usageData=d;renderUsageCharts();const s=d.summary||{};const cards=[['输入 Token',s.input_tokens,'含缓存命中输入'],['缓存命中',s.cached_input_tokens,`命中率 ${pct((s.cache_hit_rate||0)*100)}`],['未缓存输入',s.uncached_input_tokens,'输入减去缓存命中'],['输出 Token',s.output_tokens,'含推理输出'],['推理 Token',s.reasoning_output_tokens,'输出中的推理部分']];$('usageCards').innerHTML=cards.map(([label,value,hint])=>`<article class="card"><div class="label">${label}</div><div class="value" style="font-size:26px" title="${number(value)} Token">${tokenNumber(value)}<span class="token-unit">Token</span></div><div class="hint">${hint}</div></article>`).join('');$('usageModels').innerHTML=usageTable(d.by_model||[],'model');$('usageDays').innerHTML=usageTable(d.by_day||[],'date');$('usageSessions').innerHTML=usageTable(d.by_session||[],'session_id');$('usageTopRange').textContent=`${$('usageStart').value||'最早记录'} 至 ${$('usageEnd').value||'最新记录'} · 按输入 + 输出排序`;$('usageTopSessions').innerHTML=(d.by_session||[]).slice(0,3).map((r,i)=>`<div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)"><span class="pill">${i+1}</span><div style="flex:1;min-width:0"><strong style="overflow-wrap:anywhere">${esc(r.title||'未命名对话')}</strong><div class="small" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:6px">${[['输入',r.input_tokens],['输出',r.output_tokens],['缓存命中',r.cached_input_tokens],['未缓存输入',r.uncached_input_tokens],['推理',r.reasoning_output_tokens],['缓存写入',r.cache_write_input_tokens]].map(([label,value])=>`<span title="${label}：${number(value)} Token">${label} <strong>${tokenNumber(value)}</strong> Token</span>`).join('')}<span>缓存命中率 <strong style="color:var(--luna)">${r.input_tokens?pct((r.cache_hit_rate||0)*100):'—'}</strong></span></div></div><span title="${number(r.total_tokens)} Token" style="white-space:nowrap">${tokenNumber(r.total_tokens)} Token</span></div>`).join('')||'<p class="muted">所选日期内没有记录</p>';$('usageStatus').textContent=`输入 + 输出：${tokenNumber(s.total_tokens)} Token · 缓存写入：${tokenNumber(s.cache_write_input_tokens)} Token · ${d.coverage?.note||'按请求增量统计，已去除重复记录'}${d.coverage?.errors? ' · 存在无法读取或解析的记录，请留意统计可能不完整':''}`;}catch(e){if(seq===usageSeq)$('usageStatus').textContent=`用量读取失败：${e.message}`}}
 function localDate(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
 function usagePeriod(p){let today=new Date(),start=new Date();const days={week:7,fortnight:15,month:30}[p];if(days)start.setDate(start.getDate()-days+1);$('usageStart').value=p==='all'?'':localDate(start);$('usageEnd').value=p==='all'?'':localDate(today);loadUsage()}
 $('usageMetric').onchange=renderUsageCharts;document.querySelectorAll('[data-period]').forEach(b=>b.onclick=()=>usagePeriod(b.dataset.period));$('usageApply').onclick=loadUsage;usagePeriod('today');setInterval(loadUsage,30000);
-</script></body></html>"""
+</script></body></html>""".replace("__SHARED_DASHBOARD_CSS__", DASHBOARD_CSS)
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -317,10 +305,64 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self) -> None:  # noqa: N802
+        if urllib.parse.urlparse(self.path).path != "/api/cursor/import":
+            self._send(404, "application/json", b'{"error":"Not found"}')
+            return
+        origin = "http://{0}:{1}".format(DASHBOARD_HOST, self.server.server_port)
+        if self.headers.get("Origin") != origin:
+            self._send(403, "application/json", b'{"error":"Same-origin request required"}')
+            return
+        temporary = None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 20 * 1024 * 1024:
+                raise ValueError("Invalid CSV size")
+            raw = self.rfile.read(length)
+            text = raw.decode("utf-8-sig")
+            fields = csv.DictReader(io.StringIO(text)).fieldnames or []
+            required = {"Date", "Kind", "Model", "Input (w/ Cache Write)",
+                        "Input (w/o Cache Write)", "Cache Read", "Output Tokens", "Total Tokens"}
+            if not required.issubset(fields):
+                raise ValueError("Not a Cursor usage export")
+            target = Path.home() / ".cursor/model-router/usage-events.csv"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(raw)
+            os.replace(temporary, target)
+            temporary = None
+            self._send(200, "application/json", b'{"ok":true}')
+        except (ValueError, UnicodeError, csv.Error):
+            self._send(400, "application/json", b'{"error":"Invalid Cursor usage CSV (max 20 MB)"}')
+        except OSError:
+            self._send(500, "application/json", b'{"error":"Cannot save Cursor usage CSV"}')
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
             self._send(200, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"))
+            return
+        if parsed.path in ("/cursor", "/cursor/"):
+            self._send(200, "text/html; charset=utf-8", CURSOR_DASHBOARD_HTML.encode("utf-8"))
+            return
+        if parsed.path == "/api/cursor":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                payload = build_cursor_payload(
+                    Path.home() / "Library/Application Support/Cursor/User/globalStorage/state.vscdb",
+                    Path.home() / ".cursor/model-router/decisions.jsonl",
+                    start=query.get("start", [""])[0], end=query.get("end", [""])[0],
+                )
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            except ValueError:
+                self._send(400, "application/json; charset=utf-8", b'{"error":"Invalid date range"}')
+            except OSError:
+                self._send(500, "application/json; charset=utf-8", b'{"error":"Cannot read Cursor data"}')
             return
         if parsed.path == "/healthz":
             body = json.dumps({"name": DASHBOARD_NAME, "ok": True}).encode("utf-8")
