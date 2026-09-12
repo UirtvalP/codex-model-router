@@ -11,6 +11,11 @@ from codex_model_router.dashboard import DashboardHandler, DASHBOARD_HTML, build
 
 
 class UsageDashboardTests(unittest.TestCase):
+    def test_dashboard_navigation_uses_relative_links_for_subpath_deployment(self):
+        self.assertIn('href="./"', DASHBOARD_HTML)
+        self.assertIn('href="cursor"', DASHBOARD_HTML)
+        self.assertNotIn('href="/cursor"', DASHBOARD_HTML)
+
     def test_route_distribution_date_filter_uses_all_records(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'routes.jsonl'

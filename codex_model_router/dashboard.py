@@ -207,7 +207,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 </head>
 <body>
 <main class="shell">
-  <nav class="nav" aria-label="面板切换"><a href="/" class="active" aria-current="page">Codex</a><a href="/cursor">Cursor</a></nav>
+  <nav class="nav" aria-label="面板切换"><a href="./" class="active" aria-current="page">Codex</a><a href="cursor">Cursor</a></nav>
   <header class="top"><div class="brand"><h1>Codex 用量与路由面板</h1><div class="subtitle">本机任务与子 agent 的 Token 用量，以及模型路由记录</div></div><div class="status"><span class="dot" id="dot"></span><span id="status">正在连接</span><button id="refresh">立即刷新</button></div></header>
   <div id="error" class="error"></div>
   <section class="panel" style="margin-bottom:20px">

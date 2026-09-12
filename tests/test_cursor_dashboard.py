@@ -9,9 +9,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex_model_router.dashboard import DashboardHandler
+from codex_model_router.cursor_dashboard import CURSOR_DASHBOARD_HTML
 
 
 class CursorDashboardTests(unittest.TestCase):
+    def test_dashboard_uses_relative_links_for_subpath_deployment(self):
+        self.assertIn('href="./"', CURSOR_DASHBOARD_HTML)
+        self.assertIn('href="cursor"', CURSOR_DASHBOARD_HTML)
+        self.assertIn("fetch(`api/cursor?${query}`", CURSOR_DASHBOARD_HTML)
+        self.assertIn("fetch('api/cursor/import'", CURSOR_DASHBOARD_HTML)
+        self.assertNotIn('href="/cursor"', CURSOR_DASHBOARD_HTML)
+        self.assertNotIn("fetch('/api/cursor", CURSOR_DASHBOARD_HTML)
+
     def test_import_requires_same_origin_and_valid_csv(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(Path, 'home', return_value=Path(directory)):
             server = ThreadingHTTPServer(('127.0.0.1', 0), DashboardHandler)
