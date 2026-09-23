@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,7 +37,7 @@ def catalog():
     return ModelCatalog(models=dict(FALLBACK_MODELS), source="test")
 
 
-TEST_CURSOR_AGENT = str(Path("cursor-agent").resolve())
+TEST_CURSOR_AGENT = sys.executable
 
 
 def valid_payload(**overrides):
