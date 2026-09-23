@@ -3,13 +3,13 @@
 An experimental, local-first router that chooses a Codex model, reasoning
 effort, and safe delegation policy before a task runs.
 
-By default, a fixed GPT-5.3 Codex Spark/low CLI evaluator chooses directly
-among Luna, Terra, Sol, and Astra, then the selected Codex subscription model
+By default, a configurable GPT-6 Sol/medium CLI evaluator chooses directly
+among GPT-6 Luna, Sol, and Astra, then the selected Codex subscription model
 runs the task. The evaluator uses the existing ChatGPT login. If evaluation
-fails, the hook falls back to Terra/medium and records the failure.
+fails, the hook falls back to Sol/medium and records the failure.
 
 ```text
-prompt -> Codex Spark evaluator (low) -> selected Codex model + reasoning effort
+prompt -> GPT-6 Sol evaluator (medium) -> selected Codex model + reasoning effort
 ```
 
 This is an MVP, not an official OpenAI project.
@@ -19,9 +19,8 @@ This is an MVP, not an official OpenAI project.
 | Family | Intended role |
 | --- | --- |
 | Luna | Classification, formatting, bounded answers, tiny deterministic work |
-| Terra | Normal implementation, debugging, review, and moderate research |
-| Sol | Ambiguous, cross-cutting, high-consequence, or exceptionally hard work |
-| Astra | Most demanding reasoning and complex tasks |
+| Sol | Normal and demanding bounded implementation, debugging, research, and review |
+| Astra | Deep architecture, cross-system root causes, and high-risk reasoning; medium by default |
 
 The evaluator chooses the model and reasoning effort. Local validation checks
 availability and supported effort without task-content-based model upgrades.
@@ -31,7 +30,7 @@ Safety metadata can restrict delegation; it does not force a stronger model.
 
 - Python 3.9 or newer.
 - Codex CLI 0.145.0 or newer, logged in with ChatGPT.
-- Account access to the Luna, Terra, Sol, and Astra model families.
+- Account access to the GPT-6 Luna, Sol, and Astra model families.
 - The evaluator uses the existing ChatGPT login; no separate routing API key is needed.
 
 The CLI, package, and hook surfaces were validated against `codex-cli 0.145.0`.
@@ -112,7 +111,7 @@ include the normalized `task_name`, routed `model`, `reasoning_effort`, and
 Task names are normalized to lowercase letters, digits, and underscores before
 the native call. The global
 `agent-orchestration` Skill automates this pre-spawn step and falls back to
-Terra/medium if the command fails.
+Sol/medium if the command fails.
 
 After installing the package, merge the router into your user-level Codex
 hooks:
@@ -151,13 +150,12 @@ equivalent `%USERPROFILE%/.codex/config.toml` path on Windows):
 
 ```toml
 [agents]
-default_subagent_model = "gpt-5.6-terra"
+default_subagent_model = "gpt-6-sol"
 default_subagent_reasoning_effort = "medium"
 ```
 
-The online evaluator is Codex only and keeps GPT-5.3 Codex Spark/low fixed.
-Spark is used directly without `fast_mode` or `service_tier="fast"`, which are
-not advertised for this model. `--heuristic-only` remains available for
+The online evaluator defaults to GPT-6 Sol/medium with Fast disabled.
+Its model, reasoning effort, and Fast mode are configurable in `~/.codex/router/config.json`. `--heuristic-only` remains available for
 explicit offline routing. No external router, proxy-model mapping, or
 external-router cache is used.
 
@@ -229,7 +227,7 @@ authentication at the reverse proxy; do not expose the dashboard port itself.
 - Historical Codex transcripts show which model ran, not which untried model
   would have been best. Replay/judge evaluation is still needed for true
   counterfactual training labels.
-- Model discovery currently uses `codex debug models --bundled`, with a cached
+- Model discovery currently uses `codex debug models`, with a cached
   catalog and a conservative fallback. That CLI surface may evolve.
 
 More implementation detail is in [docs/codex_model_router.md](docs/codex_model_router.md).
@@ -273,3 +271,29 @@ their model and context. Evaluation errors preserve the original Task input.
 in `~/.cursor/model-router/decisions.jsonl`. A routing decision alone is not
 proof that Cursor honored the model override. Desktop and CLI behavior must be
 verified independently. Disable with `"enabled": false`.
+
+### Runtime routing configuration
+
+The live configuration is `~/.codex/router/config.json` (override with
+`CODEX_MODEL_ROUTER_CONFIG`). `evaluator` selects the classification model;
+`model_speed` controls execution speed by exact model ID, family, then `default`.
+
+The active model pool is GPT-6 Luna, Sol, and Astra. Terra is no longer required;
+normal implementation and evaluation failures use GPT-6 Sol/medium. Catalog refresh
+uses `codex debug models`; old GPT-5.6 cache entries are rejected.
+
+```json
+{
+  "evaluator": {"model": "gpt-6-sol", "reasoning_effort": "medium", "fast": false},
+  "model_speed": {"default": true, "sol": false, "astra": false},
+  "routing": {"models": {}, "preferred_models": []}
+}
+```
+
+Optional `routing.models` registers explicit model IDs and supported effort lists;
+`routing.preferred_models` controls preference within a family. At the subagent
+boundary, native parents use native candidates and API parents use only candidates
+with the same provider prefix. The latest parent `turn_context.model` determines the
+pool. Unknown parents or incomplete pools inherit the parent without model overrides.
+Configuration changes apply to the next routing call. Historical usage records keep
+their original model names.

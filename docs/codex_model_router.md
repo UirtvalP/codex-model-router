@@ -1,10 +1,10 @@
 # Codex Model Router MVP
 
-The online routing path uses a fixed GPT-5.3 Codex Spark/low CLI evaluator with
-the existing ChatGPT login. It chooses Luna, Terra, Sol, or Astra directly and
-returns a model, reasoning effort, and short reason. Spark is used without the
-separate Fast service tier because that tier is not advertised for this model.
-Evaluation failure falls back to Terra/medium and is visible in the log. No
+The online routing path uses a configurable GPT-6 Sol/medium CLI evaluator with
+the existing ChatGPT login. It chooses GPT-6 Luna, Sol, or Astra directly and
+returns a model, reasoning effort, and short reason. The evaluator defaults to Fast disabled;
+model, effort, and speed can be changed in the runtime configuration.
+Evaluation failure falls back to Sol/medium and is visible in the log. No
 local task-content rule upgrades the selected model.
 
 There is no external router backend or proxy-model mapping. `--heuristic-only`
@@ -66,7 +66,7 @@ the normalized `task_name`, selected `model`, `reasoning_effort`, and
 `fork_turns: "none"`. Task names are restricted to lowercase letters, digits,
 and underscores, with incompatible characters normalized before spawning. This
 route is logged as `agent_pre_spawn`. The user-level `agent-orchestration` Skill makes
-this call automatically before each spawn and uses Terra/medium if routing
+this call automatically before each spawn and uses Sol/medium if routing
 fails.
 
 Install the user-level hook to intercept `spawn_agent` at the `PreToolUse`
