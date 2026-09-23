@@ -21,14 +21,17 @@ from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-ROUTER_VERSION = "0.9.0"
+ROUTER_VERSION = "0.9.1"
 PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
-CODEX_EVALUATOR_MODEL = "gpt-5.3-codex-spark"
-CODEX_EVALUATOR_EFFORT = "low"
+CODEX_EVALUATOR_MODEL = "gpt-6-sol"
+CODEX_EVALUATOR_EFFORT = "medium"
 CODEX_EVALUATOR_FAST = False
+CURSOR_EVALUATOR_MODEL = "composer-2.5"
+CURSOR_EVALUATOR_BACKEND = "cursor"
+CURSOR_EVALUATOR_DEFAULT_TIMEOUT_SECONDS = 60.0
 CODEX_MODEL_ROUTER_CONFIG = "CODEX_MODEL_ROUTER_CONFIG"
 CODEX_EVALUATOR_GUARD = "CODEX_MODEL_ROUTER_EVALUATOR"
 CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -65,9 +68,8 @@ SAFETY_KEYS = (
 
 
 FALLBACK_MODELS = {
-    "gpt-5.6-luna": ("low", "medium", "high", "xhigh", "max"),
-    "gpt-5.6-terra": ("low", "medium", "high", "xhigh", "max", "ultra"),
-    "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
+    "gpt-6-luna": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
     "gpt-6-astra": ("low", "medium", "high", "xhigh", "max", "ultra"),
 }
 
@@ -78,11 +80,11 @@ class ModelCatalog:
 
     models: Dict[str, Tuple[str, ...]]
     source: str = "fallback"
+    preferred_models: Tuple[str, ...] = ()
 
     def preferred(self, family: str) -> str:
-        suffix = "-" + family.lower()
-        for model in self.models:
-            if model.lower().endswith(suffix):
+        for model in self.preferred_models + tuple(self.models):
+            if model in self.models and _model_family(model) == family.lower():
                 return model
         raise ValueError("Catalog does not contain the {0} family".format(family))
 
@@ -95,10 +97,11 @@ class ModelCatalog:
     def candidate_models(self) -> List[str]:
         preferred = [
             self.preferred("luna"),
-            self.preferred("terra"),
             self.preferred("sol"),
         ]
-        astra = [model for model in self.models if model.lower().endswith("-astra")]
+        astra = [self.preferred("astra")] if any(
+            _model_family(model) == "astra" for model in self.models
+        ) else []
         return list(dict.fromkeys(preferred + astra))
 
 
@@ -109,6 +112,9 @@ class EvaluatorConfig:
     model: str = CODEX_EVALUATOR_MODEL
     reasoning_effort: str = CODEX_EVALUATOR_EFFORT
     fast: bool = CODEX_EVALUATOR_FAST
+    backend: str = "codex"
+    agent_executable: Optional[str] = None
+    timeout_seconds: float = CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -205,10 +211,7 @@ def _catalog_from_payload(payload: Mapping[str, Any]) -> ModelCatalog:
             continue
         slug = entry.get("slug")
         levels = entry.get("supported_reasoning_levels", [])
-        if not isinstance(slug, str) or not any(
-            slug.lower().endswith("-" + family)
-            for family in ("luna", "terra", "sol", "astra")
-        ):
+        if not isinstance(slug, str) or not slug.startswith("gpt-6-") or _model_family(slug) == "unknown":
             continue
         efforts: List[str] = []
         for level in levels:
@@ -218,11 +221,11 @@ def _catalog_from_payload(payload: Mapping[str, Any]) -> ModelCatalog:
             parsed[slug] = tuple(dict.fromkeys(efforts))
     present_families = {
         family
-        for family in ("luna", "terra", "sol")
-        if any(model.lower().endswith("-" + family) for model in parsed)
+        for family in ("luna", "sol", "astra")
+        if any(_model_family(model) == family for model in parsed)
     }
-    if present_families != {"luna", "terra", "sol"}:
-        raise ValueError("Codex catalog must contain Luna, Terra, and Sol")
+    if present_families != {"luna", "sol", "astra"}:
+        raise ValueError("Codex catalog must contain GPT-6 Luna, Sol, and Astra")
     return ModelCatalog(models=parsed, source="codex-cli")
 
 
@@ -268,6 +271,26 @@ def model_fast_setting(model: str, payload: Mapping[str, Any]) -> Optional[bool]
     return None
 
 
+def _cursor_agent_executable_fallback() -> Optional[str]:
+    """Reuse the Cursor adapter's agent path when Codex config omits it."""
+    try:
+        from .cursor_router import load_config
+        path = load_config().get("agent_executable")
+    except (OSError, TypeError, ValueError):
+        return None
+    if isinstance(path, str) and os.path.isabs(path) and os.path.exists(path):
+        return path
+    return None
+
+
+def _resolve_evaluator_backend(model: str, backend: Any) -> str:
+    if backend in (None, ""):
+        return CURSOR_EVALUATOR_BACKEND if model == CURSOR_EVALUATOR_MODEL else "codex"
+    if backend not in ("codex", CURSOR_EVALUATOR_BACKEND):
+        raise ValueError("Codex evaluator config backend must be codex or cursor")
+    return backend
+
+
 def load_evaluator_config(path: Optional[Path] = None) -> EvaluatorConfig:
     """Load and validate evaluator configuration for one routing invocation."""
     payload = _load_router_config(path)
@@ -279,13 +302,38 @@ def load_evaluator_config(path: Optional[Path] = None) -> EvaluatorConfig:
     fast = evaluator.get("fast", CODEX_EVALUATOR_FAST)
     if not isinstance(model, str) or not model.strip():
         raise ValueError("Codex evaluator config model must be a nonempty string")
+    model = model.strip()
     if not isinstance(effort, str) or effort not in EFFORT_ORDER:
         raise ValueError("Codex evaluator config reasoning_effort is invalid")
     if not isinstance(fast, bool):
         raise ValueError("Codex evaluator config fast must be boolean")
-    configured_fast = model_fast_setting(model.strip(), payload)
-    return EvaluatorConfig(model=model.strip(), reasoning_effort=effort,
-                           fast=fast if configured_fast is None else configured_fast)
+    backend = _resolve_evaluator_backend(model, evaluator.get("backend"))
+    agent_executable = evaluator.get("agent_executable")
+    timeout_seconds = evaluator.get("timeout_seconds")
+    if backend == CURSOR_EVALUATOR_BACKEND:
+        if model != CURSOR_EVALUATOR_MODEL:
+            raise ValueError("Cursor evaluator model must be composer-2.5")
+        if not isinstance(agent_executable, str) or not os.path.isabs(agent_executable):
+            agent_executable = _cursor_agent_executable_fallback()
+        if not isinstance(agent_executable, str) or not os.path.isabs(agent_executable):
+            raise ValueError("Cursor evaluator requires an absolute agent_executable")
+        if timeout_seconds is None:
+            timeout_seconds = CURSOR_EVALUATOR_DEFAULT_TIMEOUT_SECONDS
+    else:
+        agent_executable = None
+        if timeout_seconds is None:
+            timeout_seconds = CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS
+    if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0 or timeout_seconds > 120:
+        raise ValueError("Codex evaluator timeout_seconds must be between 0 and 120")
+    configured_fast = model_fast_setting(model, payload)
+    return EvaluatorConfig(
+        model=model,
+        reasoning_effort=effort,
+        fast=fast if configured_fast is None else configured_fast,
+        backend=backend,
+        agent_executable=agent_executable,
+        timeout_seconds=float(timeout_seconds),
+    )
 
 
 def _read_catalog_cache(path: Path) -> Optional[ModelCatalog]:
@@ -297,10 +345,7 @@ def _read_catalog_cache(path: Path) -> Optional[ModelCatalog]:
     for model, efforts in raw_models.items():
         if not isinstance(model, str) or not isinstance(efforts, list):
             continue
-        if not any(
-            model.lower().endswith("-" + family)
-            for family in ("luna", "terra", "sol", "astra")
-        ):
+        if not model.startswith("gpt-6-") or _model_family(model) == "unknown":
             continue
         normalized = tuple(
             effort for effort in efforts if effort in EFFORT_ORDER
@@ -309,10 +354,10 @@ def _read_catalog_cache(path: Path) -> Optional[ModelCatalog]:
             models[model] = normalized
     present_families = {
         family
-        for family in ("luna", "terra", "sol")
-        if any(model.lower().endswith("-" + family) for model in models)
+        for family in ("luna", "sol", "astra")
+        if any(_model_family(model) == family for model in models)
     }
-    if present_families != {"luna", "terra", "sol"}:
+    if present_families != {"luna", "sol", "astra"}:
         return None
     return ModelCatalog(models=models, source="codex-cli-cache")
 
@@ -350,14 +395,14 @@ def discover_catalog(
         cached = _read_catalog_cache(active_cache_path)
         cache_age = time.time() - active_cache_path.stat().st_mtime
         if cached is not None and cache_age <= cache_ttl_seconds:
-            return cached
+            return configure_catalog(cached, _load_router_config())
     except (OSError, TypeError, ValueError):
         cached = None
 
     try:
         executable = codex_executable or find_codex_executable()
         completed = subprocess.run(
-            [executable, "debug", "models", "--bundled"],
+            [executable, "debug", "models"],
             check=False,
             capture_output=True,
             text=True,
@@ -372,12 +417,39 @@ def discover_catalog(
                 _write_catalog_cache(active_cache_path, catalog)
             except OSError:
                 pass
-            return catalog
+            return configure_catalog(catalog, _load_router_config())
     except (FileNotFoundError, json.JSONDecodeError, OSError, subprocess.SubprocessError, ValueError):
         pass
     if cached is not None:
-        return ModelCatalog(models=cached.models, source="codex-cli-cache-stale")
-    return ModelCatalog(models=dict(FALLBACK_MODELS), source="fallback")
+        return configure_catalog(
+            ModelCatalog(models=cached.models, source="codex-cli-cache-stale"),
+            _load_router_config(),
+        )
+    return configure_catalog(
+        ModelCatalog(models=dict(FALLBACK_MODELS), source="fallback"),
+        _load_router_config(),
+    )
+
+
+def configure_catalog(catalog: ModelCatalog, payload: Mapping[str, Any]) -> ModelCatalog:
+    """Apply explicit runtime candidates and per-family preference order."""
+    routing = payload.get("routing", {})
+    if not isinstance(routing, Mapping):
+        raise ValueError("routing must be an object")
+    additions = routing.get("models", {})
+    preferred = routing.get("preferred_models", [])
+    if not isinstance(additions, Mapping) or not isinstance(preferred, list):
+        raise ValueError("routing.models must be an object and preferred_models a list")
+    models = dict(catalog.models)
+    for model, efforts in additions.items():
+        if (not isinstance(model, str) or _model_family(model) == "unknown"
+                or not isinstance(efforts, list) or not efforts
+                or any(not isinstance(item, str) or item not in EFFORT_ORDER for item in efforts)):
+            raise ValueError("Invalid routing model or reasoning efforts")
+        models[model] = tuple(dict.fromkeys(efforts))
+    if any(not isinstance(model, str) or model not in models for model in preferred):
+        raise ValueError("preferred_models must reference available routing models")
+    return ModelCatalog(models, catalog.source, tuple(preferred))
 
 
 def _empty_safety() -> Dict[str, bool]:
@@ -520,7 +592,7 @@ def classify_heuristically(task: str, catalog: ModelCatalog) -> RouteChoice:
         reason = "Cross-cutting task needs deeper reasoning."
         confidence = 0.70
     elif task_type in ("implement", "debug", "review", "research"):
-        model = catalog.preferred("terra")
+        model = catalog.preferred("sol")
         effort = "medium"
         risk = "medium" if task_type in ("debug", "review") else "low"
         orchestration = "single"
@@ -599,8 +671,7 @@ def _classifier_prompt(task: str, surface: str, catalog: ModelCatalog) -> str:
         "reliability come before cost; use cost only to break ties between equally suitable models.\n\n"
         "Model roles:\n"
         "- Luna: quick classification, formatting, bounded answers, tiny deterministic work.\n"
-        "- Terra: normal implementation, debugging, reviews, and moderate research.\n"
-        "- Sol: demanding but bounded implementation, debugging, and reviews where the approach "
+        "- Sol: normal and demanding bounded implementation, debugging, research, and reviews where the approach "
         "is reasonably understood and correctness can be checked locally.\n"
         "- Astra: deep architectural decisions, unclear root causes spanning systems, "
         "complex concurrency or correctness proofs, interacting constraints with major tradeoffs, "
@@ -944,8 +1015,125 @@ def classify_with_codex(
         return choice
 
 
+def _unwrap_cursor_result(raw: str) -> Mapping[str, Any]:
+    try:
+        envelope = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Cursor evaluator did not return JSON") from exc
+    if not isinstance(envelope, Mapping) or envelope.get("is_error") is True:
+        raise ValueError("Cursor evaluator returned an error")
+    value: Any = envelope.get("result", envelope)
+    if isinstance(value, str):
+        value = value.strip()
+        if value.startswith("```json\n") and value.endswith("```"):
+            value = value[8:-3].strip()
+        elif value.startswith("```\n") and value.endswith("```"):
+            value = value[4:-3].strip()
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Cursor evaluator result was not JSON") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("Cursor evaluator result must be an object")
+    return value
+
+
+def build_cursor_classifier_command(agent_executable: str, workspace: str) -> List[str]:
+    return [
+        agent_executable,
+        "-p",
+        "Follow the supplied routing input. Return only the requested JSON. Do not use tools.",
+        "--mode",
+        "ask",
+        "--model",
+        CURSOR_EVALUATOR_MODEL,
+        "--output-format",
+        "json",
+        "--workspace",
+        workspace,
+    ]
+
+
+def classify_with_cursor(
+    task: str,
+    catalog: ModelCatalog,
+    surface: str,
+    evaluator_config: Optional[EvaluatorConfig] = None,
+    runner: Callable[..., Any] = subprocess.run,
+) -> RouteChoice:
+    """Classify one Codex task with Cursor Composer 2.5."""
+
+    if os.environ.get(CODEX_EVALUATOR_GUARD):
+        raise RuntimeError("recursive Codex evaluator invocation blocked")
+    active_evaluator_config = evaluator_config or load_evaluator_config()
+    if active_evaluator_config.backend != CURSOR_EVALUATOR_BACKEND:
+        raise ValueError("Cursor evaluator requires backend=cursor")
+    if not active_evaluator_config.agent_executable:
+        raise ValueError("Cursor evaluator requires an absolute agent_executable")
+    started = time.perf_counter()
+    workspace = tempfile.mkdtemp(prefix="codex-router-cursor-")
+    environment = classifier_environment()
+    prompt = (
+        _classifier_prompt(task, surface, catalog)
+        + "\nOutput schema:\n"
+        + json.dumps(_classifier_schema(catalog), ensure_ascii=False, sort_keys=True)
+        + "\nReturn only that JSON object."
+    )
+    try:
+        result = runner(
+            build_cursor_classifier_command(active_evaluator_config.agent_executable, workspace),
+            input=prompt,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(0.1, active_evaluator_config.timeout_seconds),
+            env=environment,
+            cwd=workspace,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            message = detail[-1] if detail else "no stderr detail"
+            raise RuntimeError(
+                "Cursor evaluator exited {0}: {1}".format(result.returncode, message[:240])
+            )
+        payload = _unwrap_cursor_result(result.stdout)
+        required = {
+            "model",
+            "effort",
+            "orchestration",
+            "task_type",
+            "risk",
+            "parallelizable",
+            "confidence",
+            "reason",
+            "safety",
+        }
+        payload = {key: payload[key] for key in required if key in payload}
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        choice = _choice_from_payload(payload, elapsed_ms)
+        if choice.model not in catalog.models:
+            raise ValueError("Codex evaluator selected an unavailable model")
+        if not catalog.supports(choice.model, choice.effort):
+            raise ValueError("Codex evaluator selected an unsupported effort")
+        choice.evaluator_model = active_evaluator_config.model
+        choice.evaluator_reasoning_effort = active_evaluator_config.reasoning_effort
+        choice.evaluator_fast = active_evaluator_config.fast
+        choice.evaluator_reason = choice.reason
+        return choice
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "Cursor evaluator timed out after {0:.1f}s".format(
+                active_evaluator_config.timeout_seconds
+            )
+        ) from exc
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def _model_family(model: str) -> str:
     lowered = model.lower()
+    if lowered.endswith("-joybuilder"):
+        lowered = lowered[:-len("-joybuilder")]
     for family in ("luna", "terra", "sol", "astra"):
         if lowered.endswith("-" + family):
             return family
@@ -1043,7 +1231,7 @@ def apply_policy(
             overrides.append("unsafe or non-parallel task cannot auto-delegate")
         else:
             if not catalog.supports(model, "ultra"):
-                model = catalog.preferred("terra")
+                model = catalog.preferred("sol")
             effort = _normalize_effort(catalog, model, "ultra")
             if effort == "ultra" and choice.effort != "ultra":
                 overrides.append("independent workstreams enabled ultra delegation")
@@ -1103,14 +1291,22 @@ def route_task(
         evaluator_config = EvaluatorConfig()
         try:
             evaluator_config = load_evaluator_config()
-            choice = classify_with_codex(
-                task,
-                active_catalog,
-                surface,
-                codex_executable=codex_executable,
-                timeout_seconds=classifier_timeout_seconds,
-                evaluator_config=evaluator_config,
-            )
+            if evaluator_config.backend == CURSOR_EVALUATOR_BACKEND:
+                choice = classify_with_cursor(
+                    task,
+                    active_catalog,
+                    surface,
+                    evaluator_config=evaluator_config,
+                )
+            else:
+                choice = classify_with_codex(
+                    task,
+                    active_catalog,
+                    surface,
+                    codex_executable=codex_executable,
+                    timeout_seconds=classifier_timeout_seconds,
+                    evaluator_config=evaluator_config,
+                )
         except (
             KeyError,
             OSError,
@@ -1120,16 +1316,16 @@ def route_task(
             subprocess.SubprocessError,
         ) as exc:
             choice = RouteChoice(
-                model=active_catalog.preferred("terra"),
+                model=active_catalog.preferred("sol"),
                 effort=_normalize_effort(
-                    active_catalog, active_catalog.preferred("terra"), "medium"
+                    active_catalog, active_catalog.preferred("sol"), "medium"
                 ),
                 orchestration="single",
                 task_type=_task_type(task),
                 risk="medium",
                 parallelizable=False,
                 confidence=0.0,
-                reason="Codex evaluator was unavailable; safe Terra/medium fallback.",
+                reason="Codex evaluator was unavailable; safe Sol/medium fallback.",
                 safety=scan_safety(task),
                 source="codex-evaluator-fallback",
                 classifier_ms=int((time.perf_counter() - evaluator_started) * 1000),
@@ -1141,12 +1337,12 @@ def route_task(
             )
     decision = apply_policy(choice, task, active_catalog, surface=surface)
     if choice.source == "codex-evaluator-fallback":
-        terra = active_catalog.preferred("terra")
-        decision.model = terra
-        decision.effort = _normalize_effort(active_catalog, terra, "medium")
+        sol = active_catalog.preferred("sol")
+        decision.model = sol
+        decision.effort = _normalize_effort(active_catalog, sol, "medium")
         decision.orchestration = "single"
         decision.parallelizable = False
-        decision.overrides.append("Codex evaluator failure forced Terra/medium fallback")
+        decision.overrides.append("Codex evaluator failure forced Sol/medium fallback")
     # 在线评估器的选模结果不再由本地任务特征或历史反馈改写。
     if use_feedback and heuristic_only:
         try:
@@ -1444,10 +1640,10 @@ def _feedback_choice(
     if rating == "underpowered":
         family = _model_family(model)
         if family == "luna":
-            model = catalog.preferred("terra")
-            effort = _effort_at_least(catalog, model, effort, "medium")
-        elif family == "terra":
             model = catalog.preferred("sol")
+            effort = _effort_at_least(catalog, model, effort, "medium")
+        elif family in ("terra", "sol"):
+            model = catalog.preferred("astra")
             effort = _effort_at_least(catalog, model, effort, "medium")
         else:
             if effort == "ultra":
@@ -1459,9 +1655,9 @@ def _feedback_choice(
         if current.risk == "high" or any(current.safety.values()):
             return None
         family = _model_family(model)
-        if family == "sol":
-            model = catalog.preferred("terra")
-        elif family == "terra" and current.task_type in (
+        if family == "astra":
+            model = catalog.preferred("sol")
+        elif family in ("terra", "sol") and current.task_type in (
             "answer",
             "explain",
             "research",
@@ -1495,7 +1691,7 @@ def _feedback_choice(
 
 
 def _model_rank(model: str) -> int:
-    return {"luna": 0, "terra": 1, "sol": 2}.get(_model_family(model), 2)
+    return {"luna": 0, "terra": 1, "sol": 1, "astra": 2}.get(_model_family(model), 2)
 
 
 def _make_feedback_monotonic(
@@ -1765,6 +1961,71 @@ def task_from_hook(payload: Mapping[str, Any]) -> str:
     return ""
 
 
+def parent_model_from_hook(payload: Mapping[str, Any]) -> Optional[str]:
+    """Read the latest parent turn, never the requested child model."""
+    home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    transcript = payload.get("transcript_path")
+    paths = []
+    if isinstance(transcript, str) and transcript:
+        paths = [Path(transcript)]
+    else:
+        thread = payload.get("thread_id") or payload.get("session_id") or os.environ.get("CODEX_THREAD_ID")
+        if not isinstance(thread, str) or not re.fullmatch(r"[0-9a-fA-F-]{36}", thread):
+            return None
+        for directory in ("sessions", "archived_sessions"):
+            paths.extend((home / directory).glob("**/*" + thread + ".jsonl"))
+    if len(paths) != 1:
+        return None
+    try:
+        # 从尾部倒序读取，避免每次选模扫描整段对话。
+        with paths[0].open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            remainder = b""
+            while position:
+                size = min(position, 65536)
+                position -= size
+                handle.seek(position)
+                lines = (handle.read(size) + remainder).split(b"\n")
+                remainder = lines.pop(0)
+                if position == 0:
+                    lines.insert(0, remainder)
+                for line in reversed(lines):
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    if isinstance(record, Mapping) and record.get("type") == "turn_context":
+                        context = record.get("payload", {})
+                        model = context.get("model") if isinstance(context, Mapping) else None
+                        return model if isinstance(model, str) and model else None
+    except OSError:
+        pass
+    return None
+
+
+def model_backend(model: str) -> str:
+    # 带 provider 前缀的 ID 属于 API；不同 API provider 也不混用。
+    return model.split("/", 1)[0].lower() if "/" in model else "native"
+
+
+def catalog_for_parent(catalog: ModelCatalog, parent_model: str) -> Optional[ModelCatalog]:
+    backend = model_backend(parent_model)
+    models = {m: e for m, e in catalog.models.items() if model_backend(m) == backend}
+    if not all(any(_model_family(m) == f for m in models) for f in ("luna", "sol", "astra")):
+        return None
+    return ModelCatalog(models, catalog.source,
+                        tuple(m for m in catalog.preferred_models if m in models))
+
+
+def _inherit_hook_input(tool_input: Mapping[str, Any]) -> Dict[str, Any]:
+    updated = dict(tool_input)
+    for key in ("model", "reasoning_effort"):
+        updated.pop(key, None)
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+            "permissionDecision": "allow", "updatedInput": updated}}
+
+
 def run_hook(
     payload: Mapping[str, Any],
     heuristic_only: bool = False,
@@ -1791,6 +2052,13 @@ def run_hook(
     task = task_from_hook(prepared_payload)
     if not task:
         return None
+
+    parent_model = parent_model_from_hook(payload)
+    if not parent_model:
+        return _inherit_hook_input(tool_input)
+    if (preserve_model and tool_input.get("model")
+            and model_backend(str(tool_input["model"])) != model_backend(parent_model)):
+        return _inherit_hook_input(tool_input)
 
     if preserve_model and tool_input.get("model"):
         decision = _explicit_model_decision(task, tool_input)
@@ -1822,7 +2090,9 @@ def run_hook(
             }
         }
 
-    active_catalog = discover_catalog()
+    active_catalog = catalog_for_parent(discover_catalog(), parent_model)
+    if active_catalog is None:
+        return _inherit_hook_input(tool_input)
     decision = route_task(
         task,
         catalog=active_catalog,

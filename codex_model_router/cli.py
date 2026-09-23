@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--classifier-timeout",
         type=float,
         default=CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS,
-        help="Seconds before using the Terra/medium fallback",
+        help="Seconds before using the Sol/medium fallback",
     )
     parser.add_argument(
         "--no-log",

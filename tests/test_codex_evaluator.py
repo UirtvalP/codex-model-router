@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,9 +37,12 @@ def catalog():
     return ModelCatalog(models=dict(FALLBACK_MODELS), source="test")
 
 
+TEST_CURSOR_AGENT = sys.executable
+
+
 def valid_payload(**overrides):
     payload = {
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-luna",
         "effort": "low",
         "orchestration": "single",
         "task_type": "answer",
@@ -84,9 +88,8 @@ class CodexEvaluatorTests(unittest.TestCase):
     def test_model_speed_policy_and_execution_commands(self):
         payload = {"model_speed": {"default": True, "sol": False, "astra": False}}
         self.config_path.write_text(json.dumps(payload))
-        for model, expected in [("gpt-5.6-luna", True), ("gpt-5.6-terra", True),
-                                ("gpt-5.6-sol", False), ("gpt-6-astra", False),
-                                ("gpt-5.3-codex-spark", True)]:
+        for model, expected in [("gpt-6-luna", True), ("gpt-6-sol", False),
+                                ("gpt-6-astra", False)]:
             self.assertEqual(model_fast_setting(model, payload), expected)
             decision = route_task("Reply hello", catalog(), heuristic_only=True, use_feedback=False)
             decision.model = model
@@ -95,15 +98,15 @@ class CodexEvaluatorTests(unittest.TestCase):
                 self.assertIn('service_tier="{0}"'.format("fast" if expected else "default"), command)
                 index = command.index("fast_mode")
                 self.assertEqual(command[index - 1], "--enable" if expected else "--disable")
-        self.assertTrue(load_evaluator_config().fast)
+        self.assertFalse(load_evaluator_config().fast)
         self.config_path.write_text("{")
         command = build_codex_command("codex", decision)
         self.assertIn('service_tier="default"', command)
-        payload["model_speed"]["gpt-5.6-sol"] = True
-        self.assertTrue(model_fast_setting("gpt-5.6-sol", payload))
-        self.assertIsNone(model_fast_setting("gpt-5.6-sol", {}))
+        payload["model_speed"]["gpt-6-sol"] = True
+        self.assertTrue(model_fast_setting("gpt-6-sol", payload))
+        self.assertIsNone(model_fast_setting("gpt-6-sol", {}))
         with self.assertRaises(ValueError):
-            model_fast_setting("gpt-5.6-sol", {"model_speed": {"sol": "false"}})
+            model_fast_setting("gpt-6-sol", {"model_speed": {"sol": "false"}})
 
     def test_skill_budget_notice_is_not_a_disabled_tool(self):
         notice = {"type": "item.completed", "item": {
@@ -133,14 +136,14 @@ class CodexEvaluatorTests(unittest.TestCase):
         config_environment.start()
         self.addCleanup(config_environment.stop)
 
-    def test_classifier_command_uses_default_isolated_spark_evaluator(self):
+    def test_classifier_command_uses_default_isolated_sol_evaluator(self):
         command = build_classifier_command(
             "codex", CODEX_EVALUATOR_MODEL, "empty", "schema.json", "output.json"
         )
         joined = " ".join(command)
         self.assertIn(CODEX_EVALUATOR_MODEL, command)
-        self.assertIn('model_reasoning_effort="low"', command)
-        self.assertEqual(CODEX_EVALUATOR_MODEL, "gpt-5.3-codex-spark")
+        self.assertIn('model_reasoning_effort="medium"', command)
+        self.assertEqual(CODEX_EVALUATOR_MODEL, "gpt-6-sol")
         self.assertIn('service_tier="default"', command)
         self.assertNotIn("--enable fast_mode", joined)
         self.assertIn("--disable fast_mode", joined)
@@ -166,7 +169,7 @@ class CodexEvaluatorTests(unittest.TestCase):
     def test_classifier_command_applies_configured_effort_and_fast(self):
         command = build_classifier_command(
             "codex",
-            "gpt-5.6-terra",
+            "gpt-6-astra",
             "empty",
             "schema.json",
             "output.json",
@@ -174,7 +177,7 @@ class CodexEvaluatorTests(unittest.TestCase):
             evaluator_fast=True,
         )
         joined = " ".join(command)
-        self.assertIn("gpt-5.6-terra", command)
+        self.assertIn("gpt-6-astra", command)
         self.assertIn('model_reasoning_effort="high"', command)
         self.assertIn('service_tier="fast"', command)
         self.assertIn("--enable fast_mode", joined)
@@ -214,7 +217,7 @@ class CodexEvaluatorTests(unittest.TestCase):
             selected = classify_with_codex(
                 "Compute 2+2", catalog(), "agent", codex_executable="codex"
             )
-        self.assertEqual((selected.model, selected.effort), ("gpt-5.6-luna", "low"))
+        self.assertEqual((selected.model, selected.effort), ("gpt-6-luna", "low"))
         self.assertEqual(selected.source, "codex-evaluator")
         self.assertEqual(selected.evaluator_model, CODEX_EVALUATOR_MODEL)
         self.assertEqual(selected.evaluator_reasoning_effort, CODEX_EVALUATOR_EFFORT)
@@ -238,21 +241,21 @@ class CodexEvaluatorTests(unittest.TestCase):
                 "codex_model_router.router.subprocess.Popen", side_effect=process_factory
             ):
                 config_path.write_text(
-                    json.dumps({"evaluator": {"model": "gpt-5.6-terra", "reasoning_effort": "high", "fast": True}}),
+                    json.dumps({"evaluator": {"model": "gpt-6-astra", "reasoning_effort": "high", "fast": True}}),
                     encoding="utf-8",
                 )
                 first = classify_with_codex(
                     "Classify this", catalog(), "agent", codex_executable="codex"
                 )
                 config_path.write_text(
-                    json.dumps({"evaluator": {"model": "gpt-5.6-sol", "reasoning_effort": "medium", "fast": False}}),
+                    json.dumps({"evaluator": {"model": "gpt-6-sol", "reasoning_effort": "medium", "fast": False}}),
                     encoding="utf-8",
                 )
                 second = classify_with_codex(
                     "Classify this", catalog(), "agent", codex_executable="codex"
                 )
-        self.assertEqual((first.evaluator_model, first.evaluator_reasoning_effort, first.evaluator_fast), ("gpt-5.6-terra", "high", True))
-        self.assertEqual((second.evaluator_model, second.evaluator_reasoning_effort, second.evaluator_fast), ("gpt-5.6-sol", "medium", False))
+        self.assertEqual((first.evaluator_model, first.evaluator_reasoning_effort, first.evaluator_fast), ("gpt-6-astra", "high", True))
+        self.assertEqual((second.evaluator_model, second.evaluator_reasoning_effort, second.evaluator_fast), ("gpt-6-sol", "medium", False))
         self.assertIn('service_tier="fast"', commands[0])
         self.assertIn("--enable", commands[0])
         self.assertIn('service_tier="default"', commands[1])
@@ -341,7 +344,7 @@ class CodexEvaluatorTests(unittest.TestCase):
 
     def test_route_task_uses_codex_evaluator(self):
         selected = RouteChoice(
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             effort="low",
             orchestration="single",
             task_type="answer",
@@ -361,7 +364,7 @@ class CodexEvaluatorTests(unittest.TestCase):
         evaluator.assert_called_once()
         self.assertEqual(decision.source, "codex-evaluator")
 
-    def test_failure_falls_back_to_terra_medium_with_latency(self):
+    def test_failure_falls_back_to_sol_medium_with_latency(self):
         with patch(
             "codex_model_router.router.classify_with_codex",
             side_effect=RuntimeError("login unavailable"),
@@ -369,14 +372,14 @@ class CodexEvaluatorTests(unittest.TestCase):
             "codex_model_router.router.time.perf_counter", side_effect=(10.0, 10.125)
         ):
             decision = route_task("Implement a helper", catalog=catalog())
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-terra", "medium"))
+        self.assertEqual((decision.model, decision.effort), ("gpt-6-sol", "medium"))
         self.assertEqual(decision.source, "codex-evaluator-fallback")
         self.assertEqual(decision.classifier_ms, 125)
         self.assertIn("login unavailable", decision.evaluator_error)
 
     def test_evaluator_log_keeps_observability_without_removed_backend_fields(self):
         choice = RouteChoice(
-            model="gpt-5.6-luna",
+            model="gpt-6-luna",
             effort="low",
             orchestration="single",
             task_type="answer",
@@ -420,6 +423,83 @@ class CodexEvaluatorTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
             parser.parse_args(["--backend", "notdiamond", "task"])
         self.assertEqual(raised.exception.code, 2)
+
+    def test_composer_evaluator_config_defaults(self):
+        self.config_path.write_text(json.dumps({
+            "evaluator": {
+                "model": "composer-2.5",
+                "agent_executable": TEST_CURSOR_AGENT,
+                "reasoning_effort": "medium",
+                "fast": False,
+            }
+        }))
+        config = load_evaluator_config()
+        self.assertEqual(config.backend, "cursor")
+        self.assertEqual(config.model, "composer-2.5")
+        self.assertEqual(config.agent_executable, TEST_CURSOR_AGENT)
+        self.assertEqual(config.timeout_seconds, 60.0)
+
+    def test_composer_evaluator_requires_agent_executable(self):
+        self.config_path.write_text(json.dumps({
+            "evaluator": {"model": "composer-2.5"}
+        }))
+        with patch("codex_model_router.router._cursor_agent_executable_fallback", return_value=None):
+            with self.assertRaises(ValueError):
+                load_evaluator_config()
+
+    def test_cursor_classifier_selects_from_codex_catalog(self):
+        from codex_model_router.router import classify_with_cursor
+
+        payload = valid_payload(model="gpt-6-sol", effort="medium")
+        envelope = json.dumps({"result": json.dumps(payload)})
+
+        class Completed:
+            returncode = 0
+            stdout = envelope
+            stderr = ""
+
+        def runner(command, **kwargs):
+            self.assertEqual(command[0], TEST_CURSOR_AGENT)
+            self.assertIn("composer-2.5", command)
+            self.assertEqual(kwargs["input"].count("Allowed models:"), 1)
+            return Completed()
+
+        self.config_path.write_text(json.dumps({
+            "evaluator": {
+                "model": "composer-2.5",
+                "agent_executable": TEST_CURSOR_AGENT,
+            }
+        }))
+        selected = classify_with_cursor(
+            "Review this React form",
+            catalog(),
+            "root",
+            evaluator_config=load_evaluator_config(),
+            runner=runner,
+        )
+        self.assertEqual(selected.model, "gpt-6-sol")
+        self.assertEqual(selected.effort, "medium")
+        self.assertEqual(selected.evaluator_model, "composer-2.5")
+        self.assertEqual(selected.source, "codex-evaluator")
+
+    def test_route_task_uses_cursor_classifier_for_composer(self):
+        payload = valid_payload(model="gpt-6-luna", effort="low")
+        self.config_path.write_text(json.dumps({
+            "evaluator": {
+                "model": "composer-2.5",
+                "agent_executable": TEST_CURSOR_AGENT,
+            }
+        }))
+        with patch(
+            "codex_model_router.router.classify_with_cursor",
+            return_value=_choice_from_payload(payload, 11),
+        ) as cursor_route, patch(
+            "codex_model_router.router.classify_with_codex"
+        ) as codex_route:
+            decision = route_task("Format this JSON", catalog(), use_feedback=False)
+        cursor_route.assert_called_once()
+        codex_route.assert_not_called()
+        self.assertEqual(decision.model, "gpt-6-luna")
 
 
 if __name__ == "__main__":

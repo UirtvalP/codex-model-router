@@ -16,6 +16,7 @@ from codex_model_router.router import (
     RouteChoice,
     RoutingDecision,
     _catalog_from_payload,
+    _classifier_schema,
     append_decision_log,
     append_feedback,
     apply_policy,
@@ -42,7 +43,7 @@ def catalog():
 
 def choice(**overrides):
     values = {
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-luna",
         "effort": "low",
         "orchestration": "single",
         "task_type": "answer",
@@ -67,8 +68,8 @@ class DashboardTests(unittest.TestCase):
                     "timestamp": "2099-01-01T00:00:00+00:00",
                     "decision_id": "decision-a",
                     "task_summary": "4 words; type=answer; risk=low",
-                    "notdiamond": {"proxy_model": "gpt-5.6-luna", "session_id": "session-a", "request_ms": 120},
-                    "codex": {"model": "gpt-5.6-luna", "reasoning_effort": "low", "surface": "agent"},
+                    "notdiamond": {"proxy_model": "gpt-6-luna", "session_id": "session-a", "request_ms": 120},
+                    "codex": {"model": "gpt-6-luna", "reasoning_effort": "low", "surface": "agent"},
                     "cache": {"hit": False, "sample_count": 0},
                     "fallback": {"used": False, "error": None},
                     "route": {"source": "notdiamond"},
@@ -80,8 +81,8 @@ class DashboardTests(unittest.TestCase):
                     "decision_id": "decision-b",
                     "task_name": "Cached test run",
                     "task_summary": "3 words; type=implement; risk=low",
-                    "notdiamond": {"proxy_model": "gpt-5.6-terra", "session_id": None, "request_ms": 80},
-                    "codex": {"model": "gpt-5.6-terra", "reasoning_effort": "medium", "surface": "agent"},
+                    "notdiamond": {"proxy_model": "gpt-6-astra", "session_id": None, "request_ms": 80},
+                    "codex": {"model": "gpt-6-astra", "reasoning_effort": "medium", "surface": "agent"},
                     "cache": {"hit": True, "sample_count": 5},
                     "fallback": {"used": True, "error": "timeout"},
                     "route": {"source": "notdiamond-fallback"},
@@ -98,7 +99,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["stats"]["cache_hits"], 1)
         self.assertEqual(payload["stats"]["fallbacks"], 1)
         self.assertEqual(payload["stats"]["avg_request_ms"], 100)
-        self.assertEqual(payload["stats"]["models"], {"luna": 1, "terra": 1})
+        self.assertEqual(payload["stats"]["models"], {"luna": 1, "astra": 1})
         self.assertEqual(payload["log"]["invalid_lines"], 1)
         self.assertEqual(payload["routes"][0]["task"], "Cached test run")
         self.assertEqual(payload["routes"][0]["rating"], "good")
@@ -116,7 +117,7 @@ class DashboardTests(unittest.TestCase):
             path.write_text(json.dumps({
                 "event": "route_decision",
                 "decision_id": "legacy-fallback",
-                "codex": {"model": "gpt-5.6-terra", "reasoning_effort": "medium"},
+                "codex": {"model": "gpt-6-sol", "reasoning_effort": "medium"},
                 "route": {"source": "notdiamond-fallback", "nd_error": "timeout"},
             }), encoding="utf-8")
             payload = build_dashboard_payload(path)
@@ -234,15 +235,15 @@ class CatalogTests(unittest.TestCase):
             {
                 "models": [
                     {
-                        "slug": "gpt-5.6-luna",
+                        "slug": "gpt-6-luna",
                         "supported_reasoning_levels": [{"effort": "low"}],
                     },
                     {
-                        "slug": "gpt-5.6-terra",
+                        "slug": "gpt-6-astra",
                         "supported_reasoning_levels": [{"effort": "medium"}],
                     },
                     {
-                        "slug": "gpt-5.6-sol",
+                        "slug": "gpt-6-sol",
                         "supported_reasoning_levels": [
                             {"effort": "low"},
                             {"effort": "ultra"},
@@ -255,22 +256,22 @@ class CatalogTests(unittest.TestCase):
                 ]
             }
         )
-        self.assertEqual(parsed.models["gpt-5.6-sol"], ("low", "ultra"))
+        self.assertEqual(parsed.models["gpt-6-sol"], ("low", "ultra"))
         self.assertNotIn("unrelated-model", parsed.models)
 
     def test_fresh_catalog_cache_avoids_requerying_cli(self):
         payload = {
             "models": [
                 {
-                    "slug": "gpt-5.6-luna",
+                    "slug": "gpt-6-luna",
                     "supported_reasoning_levels": [{"effort": "low"}],
                 },
                 {
-                    "slug": "gpt-5.6-terra",
+                    "slug": "gpt-6-astra",
                     "supported_reasoning_levels": [{"effort": "medium"}],
                 },
                 {
-                    "slug": "gpt-5.6-sol",
+                    "slug": "gpt-6-sol",
                     "supported_reasoning_levels": [{"effort": "high"}],
                 },
             ]
@@ -293,7 +294,7 @@ class CatalogTests(unittest.TestCase):
                 {
                     "models": [
                         {
-                            "slug": "gpt-5.6-luna",
+                            "slug": "gpt-6-luna",
                             "supported_reasoning_levels": [{"effort": "low"}],
                         }
                     ]
@@ -304,15 +305,15 @@ class CatalogTests(unittest.TestCase):
         complete_payload = {
             "models": [
                 {
-                    "slug": "gpt-5.6-luna",
+                    "slug": "gpt-6-luna",
                     "supported_reasoning_levels": [{"effort": "low"}],
                 },
                 {
-                    "slug": "gpt-5.6-terra",
+                    "slug": "gpt-6-astra",
                     "supported_reasoning_levels": [{"effort": "medium"}],
                 },
                 {
-                    "slug": "gpt-5.6-sol",
+                    "slug": "gpt-6-sol",
                     "supported_reasoning_levels": [{"effort": "high"}],
                 },
             ]
@@ -320,7 +321,7 @@ class CatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "catalog.json"
             cache_path.write_text(
-                json.dumps({"models": {"gpt-5.6-luna": ["low"]}}),
+                json.dumps({"models": {"gpt-6-luna": ["low"]}}),
                 encoding="utf-8",
             )
             with patch("codex_model_router.router.subprocess.run") as runner:
@@ -330,6 +331,36 @@ class CatalogTests(unittest.TestCase):
                 runner.assert_called_once()
         self.assertEqual(discovered.source, "codex-cli")
 
+    def test_legacy_gpt56_cache_is_not_reused(self):
+        payload = {
+            "models": [
+                {"slug": "gpt-6-luna", "supported_reasoning_levels": [{"effort": "low"}]},
+                {"slug": "gpt-6-sol", "supported_reasoning_levels": [{"effort": "medium"}]},
+                {"slug": "gpt-6-astra", "supported_reasoning_levels": [{"effort": "high"}]},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "catalog.json"
+            cache_path.write_text(json.dumps({"models": {
+                "gpt-5.6-luna": ["low"],
+                "gpt-5.6-sol": ["medium"],
+                "gpt-5.6-terra": ["medium"],
+            }}), encoding="utf-8")
+            with patch("codex_model_router.router.subprocess.run") as runner:
+                runner.return_value.returncode = 0
+                runner.return_value.stdout = json.dumps(payload)
+                discovered = discover_catalog("codex", cache_path=cache_path)
+                runner.assert_called_once()
+        self.assertEqual(discovered.source, "codex-cli")
+        self.assertEqual(discovered.candidate_models(), [
+            "gpt-6-luna", "gpt-6-sol", "gpt-6-astra",
+        ])
+
+    def test_classifier_schema_offers_only_native_gpt6_three_tier_models(self):
+        models = _classifier_schema(catalog())["properties"]["model"]["enum"]
+        self.assertEqual(models, ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"])
+        self.assertFalse(any("gpt-5.6" in model or "/" in model for model in models))
+
 
 class PolicyTests(unittest.TestCase):
     def test_low_risk_formatting_stays_luna_low(self):
@@ -338,7 +369,7 @@ class PolicyTests(unittest.TestCase):
             "Format this sentence as a title",
             catalog(),
         )
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
+        self.assertEqual((decision.model, decision.effort), ("gpt-6-luna", "low"))
 
     def test_luna_implementation_preserves_selected_model(self):
         decision = apply_policy(
@@ -346,7 +377,7 @@ class PolicyTests(unittest.TestCase):
             "Implement a small local parser helper",
             catalog(),
         )
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
+        self.assertEqual((decision.model, decision.effort), ("gpt-6-luna", "low"))
 
     def test_public_deploy_keeps_model_and_single_orchestration(self):
         decision = apply_policy(
@@ -358,7 +389,7 @@ class PolicyTests(unittest.TestCase):
             "Deploy the public service to production",
             catalog(),
         )
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
+        self.assertEqual((decision.model, decision.effort), ("gpt-6-luna", "low"))
         self.assertEqual(decision.orchestration, "single")
 
     def test_external_calendar_does_not_raise_model(self):
@@ -367,14 +398,14 @@ class PolicyTests(unittest.TestCase):
             "Create a Google Calendar event for tomorrow",
             catalog(),
         )
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
+        self.assertEqual((decision.model, decision.effort), ("gpt-6-luna", "low"))
         self.assertTrue(decision.safety["external_write"])
         self.assertEqual(decision.orchestration, "single")
 
     def test_safe_parallel_root_enables_ultra(self):
         decision = apply_policy(
             choice(
-                model="gpt-5.6-sol",
+                model="gpt-6-sol",
                 effort="xhigh",
                 orchestration="multi_agent",
                 task_type="review",
@@ -389,7 +420,7 @@ class PolicyTests(unittest.TestCase):
     def test_spawned_agent_ultra_is_downgraded(self):
         decision = apply_policy(
             choice(
-                model="gpt-5.6-sol",
+                model="gpt-6-sol",
                 effort="ultra",
                 orchestration="multi_agent",
                 task_type="research",
@@ -405,7 +436,7 @@ class PolicyTests(unittest.TestCase):
     def test_ambiguous_task_cannot_auto_delegate(self):
         decision = apply_policy(
             choice(
-                model="gpt-5.6-sol",
+                model="gpt-6-sol",
                 effort="ultra",
                 orchestration="multi_agent",
                 parallelizable=True,
@@ -422,14 +453,14 @@ class PolicyTests(unittest.TestCase):
             "Summarize these notes",
             catalog(),
         )
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
+        self.assertEqual((decision.model, decision.effort), ("gpt-6-luna", "low"))
 
     def test_heuristic_routes_simple_summary_to_luna(self):
         selected = classify_heuristically(
             "Summarize this paragraph in three bullets",
             catalog(),
         )
-        self.assertEqual((selected.model, selected.effort), ("gpt-5.6-luna", "low"))
+        self.assertEqual((selected.model, selected.effort), ("gpt-6-luna", "low"))
 
     def test_informational_risk_words_do_not_trigger_action_floor(self):
         decision = apply_policy(
@@ -437,7 +468,7 @@ class PolicyTests(unittest.TestCase):
             "Summarize this invoice and explain the production OAuth incident",
             catalog(),
         )
-        self.assertEqual((decision.model, decision.effort), ("gpt-5.6-luna", "low"))
+        self.assertEqual((decision.model, decision.effort), ("gpt-6-luna", "low"))
         self.assertFalse(any(decision.safety.values()))
 
         heuristic = classify_heuristically(
@@ -451,7 +482,7 @@ class CommandTests(unittest.TestCase):
     def test_classifier_is_isolated_and_uses_chatgpt_login(self):
         command = build_classifier_command(
             "codex",
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             "empty-dir",
             "schema.json",
             "decision.json",
@@ -482,7 +513,7 @@ class CommandTests(unittest.TestCase):
     def test_real_dispatch_preserves_normal_policy_by_default(self):
         decision = RoutingDecision(
             decision_id="id",
-            model="gpt-5.6-terra",
+            model="gpt-6-sol",
             effort="medium",
             orchestration="single",
             task_type="implement",
@@ -541,6 +572,11 @@ class CommandTests(unittest.TestCase):
 
 
 class HookAndLogTests(unittest.TestCase):
+    def setUp(self):
+        parent = patch("codex_model_router.router.parent_model_from_hook", return_value="gpt-6-astra")
+        parent.start()
+        self.addCleanup(parent.stop)
+
     def test_spawn_task_name_is_normalized_before_hook_output(self):
         decision = apply_policy(choice(), "Review the local API", catalog(), surface="agent")
         payload = {
@@ -560,7 +596,7 @@ class HookAndLogTests(unittest.TestCase):
     def test_hook_preserves_all_args_when_adding_route(self):
         decision = apply_policy(
             choice(
-                model="gpt-5.6-sol",
+                model="gpt-6-sol",
                 effort="high",
                 task_type="research",
             ),
@@ -590,7 +626,7 @@ class HookAndLogTests(unittest.TestCase):
         payload = {
             "tool_input": {
                 "message": "Summarize this text",
-                "model": "gpt-5.6-luna",
+                "model": "gpt-6-luna",
                 "reasoning_effort": "low",
             }
         }
@@ -600,7 +636,7 @@ class HookAndLogTests(unittest.TestCase):
 
     def test_unmarked_parent_model_does_not_opt_agent_out_of_routing(self):
         decision = apply_policy(
-            choice(model="gpt-5.6-sol", effort="ultra", task_type="research"),
+            choice(model="gpt-6-sol", effort="ultra", task_type="research"),
             "Research several independent options",
             catalog(),
             surface="agent",
@@ -622,7 +658,7 @@ class HookAndLogTests(unittest.TestCase):
                 "reasoning_effort": "ultra",
             }
         }
-        decision = apply_policy(choice(model="gpt-5.6-sol", effort="high"), payload["tool_input"]["message"], catalog(), surface="agent")
+        decision = apply_policy(choice(model="gpt-6-sol", effort="high"), payload["tool_input"]["message"], catalog(), surface="agent")
         updated = hook_updated_input(payload, decision)
         self.assertEqual(updated["model"], decision.model)
         self.assertEqual(updated["reasoning_effort"], decision.effort)
@@ -640,8 +676,8 @@ class HookAndLogTests(unittest.TestCase):
 
     def test_recursive_spawn_calls_route_for_each_hook_invocation(self):
         payload = {"tool_name": "spawn_agent", "tool_input": {"message": "Inspect the module"}}
-        first = choice(model="gpt-5.6-luna", source="codex-evaluator")
-        second = choice(model="gpt-5.6-sol", effort="high", source="codex-evaluator")
+        first = choice(model="gpt-6-luna", source="codex-evaluator")
+        second = choice(model="gpt-6-sol", effort="high", source="codex-evaluator")
         with patch("codex_model_router.router.discover_catalog", return_value=catalog()), patch("codex_model_router.router.classify_with_codex", side_effect=[first, second]) as route:
             self.assertIsNotNone(run_hook(payload, no_log=True))
             self.assertIsNotNone(run_hook(payload, no_log=True))
@@ -652,12 +688,12 @@ class HookAndLogTests(unittest.TestCase):
             "tool_name": "Agent",
             "tool_input": {
                 "message": "Research several independent options",
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "high",
             },
         }
         routed = apply_policy(
-            choice(model="gpt-5.6-luna", effort="low"),
+            choice(model="gpt-6-luna", effort="low"),
             payload["tool_input"]["message"],
             catalog(),
             surface="agent",
@@ -666,7 +702,7 @@ class HookAndLogTests(unittest.TestCase):
             output = run_hook(payload, heuristic_only=False, no_log=True)
         route.assert_called_once()
         updated = output["hookSpecificOutput"]["updatedInput"]
-        self.assertEqual(updated["model"], "gpt-5.6-luna")
+        self.assertEqual(updated["model"], "gpt-6-luna")
         self.assertEqual(updated["reasoning_effort"], "low")
 
     def test_full_history_fork_is_changed_for_routed_model(self):
@@ -678,7 +714,7 @@ class HookAndLogTests(unittest.TestCase):
             },
         }
         routed = apply_policy(
-            choice(model="gpt-5.6-terra", effort="medium"),
+            choice(model="gpt-6-sol", effort="medium"),
             payload["tool_input"]["message"],
             catalog(),
             surface="agent",
@@ -687,7 +723,7 @@ class HookAndLogTests(unittest.TestCase):
             output = run_hook(payload, no_log=True)
         updated = output["hookSpecificOutput"]["updatedInput"]
         self.assertEqual(updated["fork_turns"], "none")
-        self.assertEqual(updated["model"], "gpt-5.6-terra")
+        self.assertEqual(updated["model"], "gpt-6-sol")
 
     def test_user_preserve_marker_keeps_explicit_model_and_strips_marker(self):
         payload = {
@@ -719,7 +755,7 @@ class HookAndLogTests(unittest.TestCase):
             },
         }
         routed = apply_policy(
-            choice(model="gpt-5.6-terra", effort="medium"),
+            choice(model="gpt-6-sol", effort="medium"),
             "Inspect the module",
             catalog(),
             surface="agent",
@@ -728,7 +764,7 @@ class HookAndLogTests(unittest.TestCase):
             output = run_hook(payload, no_log=True)
         updated = output["hookSpecificOutput"]["updatedInput"]
         self.assertEqual(updated["message"], "Inspect the module")
-        self.assertEqual(updated["model"], "gpt-5.6-terra")
+        self.assertEqual(updated["model"], "gpt-6-sol")
 
     def test_log_has_hash_and_features_but_not_raw_prompt(self):
         raw_prompt = "private unique prompt that must not be logged"
@@ -762,9 +798,21 @@ class HookAndLogTests(unittest.TestCase):
 
 
 class CliSpawnRouteTests(unittest.TestCase):
+    def test_spawn_route_without_hook_parent_uses_catalog(self):
+        output = io.StringIO()
+        with patch.object(cli_module, "find_codex_executable", return_value="codex"), patch(
+            "codex_model_router.router.discover_catalog", return_value=catalog()
+        ), redirect_stdout(output):
+            exit_code = cli_module.main([
+                "--spawn-route", "--heuristic-only", "--no-log",
+                "--prompt", "Format this JSON",
+            ])
+        self.assertEqual(exit_code, 0)
+        self.assertIn(json.loads(output.getvalue())["spawn_input"]["model"], FALLBACK_MODELS)
+
     def test_spawn_route_outputs_native_spawn_arguments_and_logs(self):
         routed = apply_policy(
-            choice(model="gpt-5.6-sol", effort="high", task_type="review"),
+            choice(model="gpt-6-sol", effort="high", task_type="review"),
             "Review the provider boundary",
             catalog(),
             surface="agent",
@@ -790,7 +838,7 @@ class CliSpawnRouteTests(unittest.TestCase):
         self.assertEqual(
             payload["spawn_input"],
             {
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "reasoning_effort": "high",
                 "fork_turns": "none",
                 "task_name": "provider_review",
@@ -824,8 +872,35 @@ class CliSpawnRouteTests(unittest.TestCase):
                 log_path=path,
                 cwd=temp_dir,
             )
-        self.assertEqual((calibrated.model, calibrated.effort), ("gpt-5.6-terra", "medium"))
+        self.assertEqual((calibrated.model, calibrated.effort), ("gpt-6-sol", "medium"))
         self.assertTrue(any("personal feedback applied" in item for item in calibrated.overrides))
+
+    def test_feedback_moves_sol_up_to_astra_and_simple_astra_down_to_sol(self):
+        task = "Explain this bounded implementation choice"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "decisions.jsonl"
+            sol = apply_policy(
+                choice(model="gpt-6-sol", effort="medium", task_type="explain"),
+                task,
+                catalog(),
+            )
+            append_decision_log(task, sol, "completed", log_path=path, cwd=temp_dir)
+            append_feedback(sol.decision_id, "underpowered", log_path=path)
+            upgraded = calibrate_with_feedback(task, sol, catalog(), log_path=path, cwd=temp_dir)
+            self.assertEqual((upgraded.model, upgraded.effort), ("gpt-6-astra", "medium"))
+
+            astra = apply_policy(
+                choice(model="gpt-6-astra", effort="high", task_type="explain"),
+                task,
+                catalog(),
+            )
+            second_path = Path(temp_dir) / "astra.jsonl"
+            append_decision_log(task, astra, "completed", log_path=second_path, cwd=temp_dir)
+            append_feedback(astra.decision_id, "overkill", log_path=second_path)
+            downgraded = calibrate_with_feedback(
+                task, astra, catalog(), log_path=second_path, cwd=temp_dir
+            )
+        self.assertEqual((downgraded.model, downgraded.effort), ("gpt-6-sol", "medium"))
 
     def test_similar_task_majority_uses_a_matching_feedback_route(self):
         examples = (
@@ -833,7 +908,7 @@ class CliSpawnRouteTests(unittest.TestCase):
             ("Summarize the second short memo", choice(task_type="explain"), "underpowered"),
             (
                 "Summarize the third short memo",
-                choice(model="gpt-5.6-sol", effort="high", task_type="explain"),
+                choice(model="gpt-6-sol", effort="high", task_type="explain"),
                 "overkill",
             ),
         )
@@ -852,7 +927,7 @@ class CliSpawnRouteTests(unittest.TestCase):
                 log_path=path,
                 cwd=temp_dir,
             )
-        self.assertEqual((calibrated.model, calibrated.effort), ("gpt-5.6-terra", "medium"))
+        self.assertEqual((calibrated.model, calibrated.effort), ("gpt-6-sol", "medium"))
 
     def test_feedback_never_reverses_direction_from_fresh_route(self):
         task = "Summarize this stable routing prompt"
@@ -863,7 +938,7 @@ class CliSpawnRouteTests(unittest.TestCase):
             append_decision_log(task, historical_low, "completed", log_path=path, cwd=temp_dir)
             append_feedback(historical_low.decision_id, "underpowered", log_path=path)
             fresh_high = apply_policy(
-                choice(model="gpt-5.6-sol", effort="high", task_type="explain"),
+                choice(model="gpt-6-sol", effort="high", task_type="explain"),
                 task,
                 catalog(),
             )
@@ -881,7 +956,7 @@ class CliSpawnRouteTests(unittest.TestCase):
 
             second_path = Path(temp_dir) / "overkill.jsonl"
             historical_high = apply_policy(
-                choice(model="gpt-5.6-sol", effort="high", task_type="explain"),
+                choice(model="gpt-6-sol", effort="high", task_type="explain"),
                 task,
                 catalog(),
             )
@@ -942,14 +1017,14 @@ class DirectModelPolicyTests(unittest.TestCase):
         for task in ("只返回2加2的结果，不要解释。", "只读查看package.json，列出scripts中的构建命令，不修改任何文件。", "只读核对这段代码的参数与接口契约，返回依据。"):
             with self.subTest(task=task):
                 result = apply_policy(choice(), task, catalog(), "agent")
-                self.assertEqual((result.model, result.effort), ("gpt-5.6-luna", "low"))
+                self.assertEqual((result.model, result.effort), ("gpt-6-luna", "low"))
                 self.assertFalse(result.overrides)
 
     def test_vague_chinese_and_english_preserve_model(self):
         for task in ("继续", "改一下", "重试！", "continue", "it"):
             with self.subTest(task=task):
                 result = apply_policy(choice(), task, catalog(), "agent")
-                self.assertEqual((result.model, result.effort), ("gpt-5.6-luna", "low"))
+                self.assertEqual((result.model, result.effort), ("gpt-6-luna", "low"))
 
     def test_astra_is_never_downgraded_by_sol_safety_floor(self):
         for task, flags in [("Deploy to production", {"public_deployment": True}), ("继续", {})]:
@@ -960,7 +1035,7 @@ class DirectModelPolicyTests(unittest.TestCase):
 class EvaluatorSelectionPreservationTests(unittest.TestCase):
     def test_evaluator_routes_ignore_content_and_feedback_upgrades(self):
         for task in ("Fix a parser bug", "Deploy production database", "继续", "修复格式化函数", "Review security access control"):
-            for family, effort in (("luna", "low"), ("terra", "medium"), ("sol", "high"), ("astra", "high")):
+            for family, effort in (("luna", "low"), ("sol", "high"), ("astra", "high")):
                 model = catalog().preferred(family)
                 selected = choice(
                     model=model,
