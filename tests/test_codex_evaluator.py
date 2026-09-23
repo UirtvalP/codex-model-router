@@ -36,6 +36,9 @@ def catalog():
     return ModelCatalog(models=dict(FALLBACK_MODELS), source="test")
 
 
+TEST_CURSOR_AGENT = str(Path("cursor-agent").resolve())
+
+
 def valid_payload(**overrides):
     payload = {
         "model": "gpt-6-luna",
@@ -424,7 +427,7 @@ class CodexEvaluatorTests(unittest.TestCase):
         self.config_path.write_text(json.dumps({
             "evaluator": {
                 "model": "composer-2.5",
-                "agent_executable": "/usr/bin/cursor-agent",
+                "agent_executable": TEST_CURSOR_AGENT,
                 "reasoning_effort": "medium",
                 "fast": False,
             }
@@ -432,7 +435,7 @@ class CodexEvaluatorTests(unittest.TestCase):
         config = load_evaluator_config()
         self.assertEqual(config.backend, "cursor")
         self.assertEqual(config.model, "composer-2.5")
-        self.assertEqual(config.agent_executable, "/usr/bin/cursor-agent")
+        self.assertEqual(config.agent_executable, TEST_CURSOR_AGENT)
         self.assertEqual(config.timeout_seconds, 60.0)
 
     def test_composer_evaluator_requires_agent_executable(self):
@@ -455,7 +458,7 @@ class CodexEvaluatorTests(unittest.TestCase):
             stderr = ""
 
         def runner(command, **kwargs):
-            self.assertEqual(command[0], "/usr/bin/cursor-agent")
+            self.assertEqual(command[0], TEST_CURSOR_AGENT)
             self.assertIn("composer-2.5", command)
             self.assertEqual(kwargs["input"].count("Allowed models:"), 1)
             return Completed()
@@ -463,7 +466,7 @@ class CodexEvaluatorTests(unittest.TestCase):
         self.config_path.write_text(json.dumps({
             "evaluator": {
                 "model": "composer-2.5",
-                "agent_executable": "/usr/bin/cursor-agent",
+                "agent_executable": TEST_CURSOR_AGENT,
             }
         }))
         selected = classify_with_cursor(
@@ -483,7 +486,7 @@ class CodexEvaluatorTests(unittest.TestCase):
         self.config_path.write_text(json.dumps({
             "evaluator": {
                 "model": "composer-2.5",
-                "agent_executable": "/usr/bin/cursor-agent",
+                "agent_executable": TEST_CURSOR_AGENT,
             }
         }))
         with patch(
