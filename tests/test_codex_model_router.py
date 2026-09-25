@@ -58,6 +58,97 @@ def choice(**overrides):
     return RouteChoice(**values)
 
 
+class EncryptedTaskHookTests(unittest.TestCase):
+    def setUp(self):
+        self.token = base64.urlsafe_b64encode(
+            b"\x80" + (1790264549).to_bytes(8, "big") + b"\0" * 64
+        ).decode("ascii")
+        self.parent = patch("codex_model_router.router.parent_model_from_hook", return_value="gpt-6-astra").start()
+        self.route = patch("codex_model_router.router.route_task").start()
+        self.discover = patch("codex_model_router.router.discover_catalog").start()
+        self.log = patch("codex_model_router.router.append_decision_log").start()
+        self.addCleanup(patch.stopall)
+
+    def run_encrypted(self, tool_input, **kwargs):
+        payload = {"tool_name": "collaboration.spawn_agent", "session_id": "test-session",
+                   "tool_input": dict({"message": self.token}, **tool_input)}
+        result = run_hook(payload, **dict({"no_log": True}, **kwargs))
+        self.route.assert_not_called()
+        self.discover.assert_not_called()
+        self.log.assert_not_called()
+        return result["hookSpecificOutput"]["updatedInput"]
+
+    def test_encrypted_task_inherits_without_changing_message_or_context(self):
+        for field in ("message", "task", "prompt"):
+            with self.subTest(field=field):
+                source = {field: "  " + self.token + "  ", "fork_turns": "all",
+                          "reasoning_effort": "low", "task_name": "audit"}
+                payload = {"tool_name": "spawn_agent", "tool_input": source}
+                result = run_hook(payload, no_log=True)["hookSpecificOutput"]["updatedInput"]
+                self.assertEqual(result[field], source[field])
+                self.assertEqual(result["fork_turns"], "all")
+                self.assertNotIn("model", result)
+                self.assertNotIn("reasoning_effort", result)
+                self.assertIn("reasoning_effort", source)
+        self.route.assert_not_called()
+        self.discover.assert_not_called()
+
+    def test_encrypted_task_keeps_explicit_model_on_same_backend(self):
+        for parent, model in (("gpt-6-astra", "gpt-6-sol"),
+                              ("gpt-6-astra", "gpt-6-luna"),
+                              ("gpt-6-astra", "gpt-6-astra"),
+                              ("oxygen/gpt-6-astra", "oxygen/gpt-6-sol")):
+            for fork in ("none", "3"):
+                with self.subTest(parent=parent, model=model, fork=fork):
+                    self.parent.return_value = parent
+                    result = self.run_encrypted({"model": model, "reasoning_effort": "high", "fork_turns": fork})
+                    self.assertEqual(result["model"], model)
+                    self.assertEqual(result["reasoning_effort"], "high")
+                    self.assertEqual(result["fork_turns"], fork)
+                    self.assertEqual(result["message"], self.token)
+
+    def test_full_history_fork_inherits_for_explicit_and_default_all(self):
+        for fork in ({}, {"fork_turns": "all"}):
+            result = self.run_encrypted(dict({"model": "gpt-6-sol", "reasoning_effort": "high"}, **fork))
+            self.assertNotIn("model", result)
+            self.assertNotIn("reasoning_effort", result)
+            self.assertEqual(result.get("fork_turns"), fork.get("fork_turns"))
+
+    def test_unknown_or_cross_backend_parent_inherits(self):
+        for parent, model in ((None, "gpt-6-sol"), ("gpt-6-astra", "oxygen/gpt-6-sol"),
+                              ("oxygen/gpt-6-astra", "openai/gpt-6-sol")):
+            self.parent.return_value = parent
+            result = self.run_encrypted({"model": model, "reasoning_effort": "high", "fork_turns": "none"})
+            self.assertNotIn("model", result)
+            self.assertNotIn("reasoning_effort", result)
+
+    def test_skip_is_logged_without_task_and_not_counted_as_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "decisions.jsonl"
+            with patch("codex_model_router.router.default_log_path", return_value=path):
+                self.run_encrypted({"task_name": "audit"}, no_log=False)
+                self.run_encrypted({"model": "gpt-6-sol", "fork_turns": "none"}, no_log=False)
+            raw = path.read_text()
+            records = [json.loads(line) for line in raw.splitlines()]
+            self.assertNotIn(self.token, raw)
+            self.assertEqual([r["event"] for r in records], ["route_skipped"] * 2)
+            self.assertEqual([r["action"] for r in records], ["inherit_parent", "preserve_explicit_model"])
+            self.assertEqual(records[1]["forwarded_model"], "gpt-6-sol")
+            self.assertEqual(build_dashboard_payload(path)["stats"]["total"], 0)
+
+    def test_skip_log_failure_does_not_break_spawn(self):
+        with patch("codex_model_router.router.default_log_path", side_effect=OSError("unavailable")):
+            self.assertEqual(self.run_encrypted({}, no_log=False)["message"], self.token)
+
+    def test_plaintext_including_token_reference_still_routes(self):
+        self.discover.return_value = catalog()
+        self.route.return_value = apply_policy(choice(), "Explain token", catalog(), surface="agent")
+        for message in ("Inspect the module", "Explain token " + self.token, "gAAAAexample"):
+            result = run_hook({"tool_name": "spawn_agent", "tool_input": {"message": message}}, no_log=True)
+            self.assertEqual(result["hookSpecificOutput"]["updatedInput"]["model"], "gpt-6-luna")
+        self.assertEqual(self.route.call_count, 3)
+
+
 class DashboardTests(unittest.TestCase):
     def test_dashboard_payload_aggregates_routes_and_feedback(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1961,6 +1961,53 @@ def task_from_hook(payload: Mapping[str, Any]) -> str:
     return ""
 
 
+def _is_encrypted_agent_task(task: str) -> bool:
+    # 只识别整段密文，正文引用 token 时仍按明文处理；不尝试解密。
+    return re.fullmatch(r"gAAAA[A-Za-z0-9_-]{75,}={0,2}", task) is not None
+
+
+def _encrypted_task_hook(
+    payload: Mapping[str, Any],
+    tool_input: Mapping[str, Any],
+    parent_model: Optional[str],
+    no_log: bool,
+) -> Dict[str, Any]:
+    updated = dict(tool_input)
+    requested_model = updated.get("model")
+    preserve = (
+        bool(parent_model)
+        and isinstance(requested_model, str)
+        and bool(requested_model)
+        and model_backend(requested_model) == model_backend(parent_model)
+        and updated.get("fork_turns", "all") != "all"
+    )
+    # 密文无法评估难度；完整历史继承和未知 provider 均沿用父模型。
+    if not preserve:
+        for key in ("model", "reasoning_effort"):
+            updated.pop(key, None)
+    if not no_log:
+        record = {
+            "event": "route_skipped",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "router_version": ROUTER_VERSION,
+            "reason": "encrypted_agent_task",
+            "action": "preserve_explicit_model" if preserve else "inherit_parent",
+            "parent_model": parent_model,
+            "forwarded_model": updated.get("model"),
+            "task_name": updated.get("task_name"),
+            "codex_session_id": payload.get("session_id") or payload.get("thread_id"),
+        }
+        try:
+            path = default_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            pass
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+            "permissionDecision": "allow", "updatedInput": updated}}
+
+
 def parent_model_from_hook(payload: Mapping[str, Any]) -> Optional[str]:
     """Read the latest parent turn, never the requested child model."""
     home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
@@ -2054,6 +2101,8 @@ def run_hook(
         return None
 
     parent_model = parent_model_from_hook(payload)
+    if _is_encrypted_agent_task(task):
+        return _encrypted_task_hook(payload, tool_input, parent_model, no_log)
     if not parent_model:
         return _inherit_hook_input(tool_input)
     if (preserve_model and tool_input.get("model")
