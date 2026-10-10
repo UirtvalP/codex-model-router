@@ -30,7 +30,7 @@ The native catalog contains supported efforts/capabilities, not comparative
 benchmarks or model-specific subscription prices. Capability retirement uses a
 reviewed comparison registry, not version order or downloaded prose. The public
 registry [model-comparisons.json](model-comparisons.json) records source,
-reviewer, date and expiry. Maintainers review official evidence and publish the
+reviewer, date and expiry. An unambiguous official release declaration is sufficient capability evidence; no independent benchmark is required. Claims are limited to the release's stated comparison objects and dimensions, never inferred from vague marketing. Release provenance records date (explicitly unknown when absent), comparison models, dimensions and price scope. Maintainers transcribe/review official declarations and publish the
 JSON through normal PR/CI. Users need not edit per-model rules to receive newly
 published comparisons, but **evidence curation is not automated**. If no reviewed
 comparison is published, new available models remain candidates and older ones

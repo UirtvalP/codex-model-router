@@ -15,8 +15,25 @@
       "prices": {
         "basis": "unknown",
         "reason": "Current route uses subscription. API prices do not establish subscription unit consumption; complete comparable subscription data unavailable."
+      },
+      "release": {
+        "date": "not stated on source page",
+        "date_note": "Observed 2026-10-10. Official GPT-6 Sol and Luna page links GPT-6.1 Sol in its 2026-09-29 update; exact release date is not inferred.",
+        "compared_models": [
+          "gpt-6-sol",
+          "gpt-6.1-sol"
+        ],
+        "dimensions": [
+          "overall across complex professional tasks",
+          "coding",
+          "business workflows",
+          "computer use",
+          "scientific research",
+          "factuality"
+        ],
+        "price_scope": "Standard API: 6.1 Sol input 2, cached input 0.10, output 10 USD/million tokens. Cached input is declared 50% below 6 Sol. API task-cost comparisons do not establish subscription usage units."
       }
     }
   ],
-  "revision": 1
+  "revision": 2
 }

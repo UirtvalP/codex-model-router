@@ -93,8 +93,16 @@ def validate_registry(data: Any) -> None:
             or not isinstance(data["comparisons"], list) or len(data["comparisons"]) > 256):
         raise ValueError("Invalid registry schema")
     for row in data["comparisons"]:
-        if not isinstance(row, dict) or set(row) != {"old", "new", "tier", "capability", "prices"}:
+        required = {"old", "new", "tier", "capability", "prices"}
+        if not isinstance(row, dict) or not required.issubset(row) or set(row) - required - {"release"}:
             raise ValueError("Invalid comparison schema")
+        release = row.get("release")
+        if release is not None:
+            if (not isinstance(release, dict) or set(release) != {"date", "date_note", "compared_models", "dimensions", "price_scope"}
+                    or not all(isinstance(release[k], str) for k in ("date", "date_note", "price_scope"))
+                    or not all(isinstance(release[k], list) and 0 < len(release[k]) <= 16
+                               and all(isinstance(v, str) for v in release[k]) for k in ("compared_models", "dimensions"))):
+                raise ValueError("Invalid release provenance")
         if not all(isinstance(row[k], str) for k in ("old", "new", "tier")):
             raise ValueError("Invalid comparison IDs")
         if not isinstance(row["capability"], dict) or not isinstance(row["prices"], dict):
