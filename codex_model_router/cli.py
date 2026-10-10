@@ -14,10 +14,13 @@ from .router import (
     CODEX_EVALUATOR_DEFAULT_TIMEOUT_SECONDS,
     append_decision_log,
     append_feedback,
+    cache_pre_spawn_decision,
     default_log_path,
+    discover_catalog,
     dispatch_codex,
     find_codex_executable,
     normalize_spawn_task_name,
+    pre_spawn_binding,
     route_task,
     run_hook,
 )
@@ -198,8 +201,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     task = _read_task(args, parser)
     codex_executable = find_codex_executable()
+    session_id = args.session_id or os.environ.get("CODEX_THREAD_ID")
+    catalog = discover_catalog(codex_executable) if args.spawn_route else None
+    binding = None
+    if args.spawn_route and not args.no_log and not args.heuristic_only:
+        try:
+            binding = pre_spawn_binding(task, session_id, args.task_name, args.cd,
+                                        catalog, args.classifier_timeout)
+        except (OSError, ValueError, TypeError):
+            pass
     decision = route_task(
         task,
+        catalog=catalog,
         surface="agent" if args.spawn_route else "root",
         heuristic_only=args.heuristic_only,
         codex_executable=codex_executable,
@@ -220,6 +233,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
             if task_name:
                 output["spawn_input"]["task_name"] = task_name
+            try:
+                if binding and binding == pre_spawn_binding(
+                        task, session_id, args.task_name, args.cd, catalog, args.classifier_timeout):
+                    cache_pre_spawn_decision(binding, decision)
+            except (OSError, ValueError, TypeError) as exc:
+                print("Codex router warning: preselection cache unavailable: {0}".format(exc),
+                      file=sys.stderr)
         print(json.dumps(output, indent=2, sort_keys=True))
         if not args.no_log:
             _try_log_decision(
@@ -229,7 +249,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 log_path=log_path,
                 cwd=args.cd,
                 task_name=task_name,
-                codex_session_id=args.session_id,
+                codex_session_id=session_id,
             )
         return 0
 

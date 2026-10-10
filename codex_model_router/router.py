@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-ROUTER_VERSION = "0.9.2"
+ROUTER_VERSION = "0.9.3"
+PRE_SPAWN_TTL_SECONDS = 300
 PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
 CODEX_EVALUATOR_MODEL = "gpt-6-sol"
 CODEX_EVALUATOR_EFFORT = "medium"
@@ -2098,6 +2099,104 @@ def _inherit_hook_input(tool_input: Mapping[str, Any], payload: Optional[Mapping
             "permissionDecision": "allow", "updatedInput": updated}}
 
 
+def pre_spawn_binding(task: str, session_id: Optional[str], task_name: Optional[str],
+                      cwd: str, catalog: ModelCatalog, timeout_seconds: float) -> Optional[str]:
+    """Bind one preselection to its exact task, caller, and current policy."""
+    if not session_id or not task_name:
+        return None
+    policy = {"config": _load_router_config(), "models": catalog.models,
+              "model_order": list(catalog.models),
+              "preferred": catalog.preferred_models, "timeout": timeout_seconds,
+              "version": ROUTER_VERSION}
+    values = {"task": task.strip(), "session": session_id,
+              "name": normalize_spawn_task_name(task_name), "cwd": _normalized_cwd(cwd),
+              "policy": policy}
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _pre_spawn_directory() -> Path:
+    return router_data_directory() / "pre_spawn"
+
+
+def cache_pre_spawn_decision(binding: Optional[str], decision: RoutingDecision) -> None:
+    """Persist only prompt-free facts; a hook can consume this decision once."""
+    if not binding or decision.source != "codex-evaluator":
+        return
+    directory = _pre_spawn_directory()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    now = time.time()
+    for path in directory.glob("*.json"):
+        if re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
+            try:
+                if now - path.stat().st_mtime > PRE_SPAWN_TTL_SECONDS:
+                    path.unlink()
+            except OSError:
+                pass
+    facts = decision.as_dict()
+    facts["reason"] = "Reused bound plaintext preselection"
+    facts["evaluator_reason"] = None
+    facts["evaluator_error"] = None
+    record = {"binding": binding, "created": now, "decision": facts}
+    temporary = directory / (uuid.uuid4().hex + ".tmp")
+    try:
+        descriptor = os.open(str(temporary), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True)
+        os.replace(str(temporary), str(directory / (binding + ".json")))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _consume_pre_spawn(binding: Optional[str], tool_input: Mapping[str, Any],
+                       catalog: ModelCatalog) -> Optional[RoutingDecision]:
+    if not binding or tool_input.get("fork_turns") != "none":
+        return None
+    directory = _pre_spawn_directory()
+    claimed = directory / (uuid.uuid4().hex + ".claim")
+    try:
+        # 原子移走后读取，两个并发 spawn 不会重复消费同一条预选。
+        os.replace(str(directory / (binding + ".json")), str(claimed))
+        if claimed.is_symlink():
+            return None
+        record = json.loads(claimed.read_text(encoding="utf-8"))
+        age = time.time() - record["created"]
+        if record["binding"] != binding or not 0 <= age <= PRE_SPAWN_TTL_SECONDS:
+            return None
+        decision = RoutingDecision(**record["decision"])
+        if (decision.source != "codex-evaluator" or decision.surface != "agent"
+                or not catalog.supports(decision.model, decision.effort)
+                or tool_input.get("model") != decision.model
+                or tool_input.get("reasoning_effort") != decision.effort):
+            return None
+        _choice_from_payload({"model": decision.model, "effort": decision.effort,
+                              "orchestration": decision.orchestration,
+                              "task_type": decision.task_type, "risk": decision.risk,
+                              "parallelizable": decision.parallelizable,
+                              "confidence": decision.confidence, "reason": decision.reason,
+                              "safety": decision.safety}, decision.classifier_ms or 0)
+        return decision
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    finally:
+        try:
+            claimed.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _log_pre_spawn_reuse(decision: RoutingDecision, payload: Mapping[str, Any],
+                         tool_input: Mapping[str, Any]) -> None:
+    record = {"event": "route_reused", "timestamp": datetime.now(timezone.utc).isoformat(),
+              "router_version": ROUTER_VERSION, "decision_id": decision.decision_id,
+              "codex_session_id": payload.get("session_id") or payload.get("thread_id"),
+              "task_name": tool_input.get("task_name"), "model": decision.model,
+              "effort": decision.effort, "source": "pre_spawn_cache"}
+    path = default_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def run_hook(
     payload: Mapping[str, Any],
     heuristic_only: bool = False,
@@ -2164,10 +2263,22 @@ def run_hook(
             }
         }
 
-    active_catalog = catalog_for_parent(discover_catalog(), parent_model)
+    discovered_catalog = discover_catalog()
+    active_catalog = catalog_for_parent(discovered_catalog, parent_model)
     if active_catalog is None:
         return _inherit_hook_input(tool_input, payload, "incomplete_backend_catalog", no_log)
-    decision = route_task(
+    decision = None
+    if not heuristic_only:
+        try:
+            binding = pre_spawn_binding(task, payload.get("session_id") or payload.get("thread_id"),
+                                        tool_input.get("task_name"),
+                                        str(payload.get("cwd") or os.getcwd()),
+                                        discovered_catalog, classifier_timeout_seconds)
+            decision = _consume_pre_spawn(binding, tool_input, active_catalog)
+        except (OSError, ValueError, TypeError):
+            pass
+    reused = decision is not None
+    decision = decision or route_task(
         task,
         catalog=active_catalog,
         surface="agent",
@@ -2181,6 +2292,10 @@ def run_hook(
         return None
     if not no_log:
         try:
+            if reused:
+                _log_pre_spawn_reuse(decision, payload, tool_input)
+                return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                        "permissionDecision": "allow", "updatedInput": updated}}
             append_decision_log(
                 task,
                 decision,

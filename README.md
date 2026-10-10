@@ -314,3 +314,22 @@ and encrypted tasks emit `route_skipped`, not successful route decisions.
 Encrypted independent forks can preserve an explicitly preselected model;
 full-history forks inherit. Confirm the actual child turn model in its rollout
 before calling an execution successfully routed.
+
+### Reuse one plaintext preselection
+
+For an independent child, pass `--task-name` and `--session-id` to
+`--spawn-route` and forward the returned `spawn_input` unchanged. The current
+`CODEX_THREAD_ID` is used when `--session-id` is omitted. If the subsequent hook
+receives plaintext, it can consume that successful online decision once instead
+of evaluating again. The binding includes exact task text, normalized task
+name, parent session, working directory, router version, runtime configuration,
+model catalog, and classifier timeout. Forwarded model/effort must match, and
+`fork_turns` must be `none`. A changed/missing binding or expired/corrupt entry
+causes a fresh evaluation; it never uses an unrelated task's decision.
+
+The prompt-free entry expires after five minutes. `--no-log`, heuristic routes,
+and evaluator fallbacks do not create entries. A cache hit emits `route_reused`
+with the original decision ID, not a second evaluator record. Encrypted hooks
+continue to preserve valid explicit independent-fork selections without
+classifying ciphertext. This does not install an automatic global pre-spawn
+rule or make the first evaluation faster.
