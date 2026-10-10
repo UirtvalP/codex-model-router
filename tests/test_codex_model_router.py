@@ -437,7 +437,7 @@ class CatalogTests(unittest.TestCase):
                 "gpt-5.6-sol": ["medium"],
                 "gpt-5.6-terra": ["medium"],
             }}), encoding="utf-8")
-            with patch("codex_model_router.router.subprocess.run") as runner:
+            with patch("codex_model_router.router.subprocess.run") as runner, patch("codex_model_router.router._load_router_config", return_value={}):
                 runner.return_value.returncode = 0
                 runner.return_value.stdout = json.dumps(payload)
                 discovered = discover_catalog("codex", cache_path=cache_path)

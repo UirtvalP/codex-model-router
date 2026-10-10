@@ -297,3 +297,20 @@ with the same provider prefix. The latest parent `turn_context.model` determines
 pool. Unknown parents or incomplete pools inherit the parent without model overrides.
 Configuration changes apply to the next routing call. Historical usage records keep
 their original model names.
+
+## macOS runtime and routing diagnostics
+
+On macOS, the router uses the executable bundled at
+`/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex` when present,
+then falls back to PATH. This avoids a stale standalone CLI hiding models
+available to the desktop app. GPT-6 minor versions such as `gpt-6.1-sol` are
+accepted in discovery and the catalog cache. Use native IDs for native parents;
+`openai/gpt-6.1-sol` belongs to a separate backend and cannot fill a native pool.
+
+`routing.excluded_models` accepts a list of exact model IDs to remove after
+configured additions. Ensure Luna, Sol, and Astra remain available on the
+parent backend. Unknown parents, cross-backend pins, incomplete backend pools,
+and encrypted tasks emit `route_skipped`, not successful route decisions.
+Encrypted independent forks can preserve an explicitly preselected model;
+full-history forks inherit. Confirm the actual child turn model in its rollout
+before calling an execution successfully routed.
