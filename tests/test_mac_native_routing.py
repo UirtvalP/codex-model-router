@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,7 +36,7 @@ class MacNativeRoutingTests(unittest.TestCase):
                 router.configure_catalog(catalog, {'routing': {'excluded_models': excluded}})
 
     def test_desktop_runtime_precedes_stale_path_on_mac(self):
-        with patch.object(router.sys, 'platform', 'darwin'), patch.object(Path, 'is_file', return_value=True), patch.object(router.os, 'access', return_value=True), patch.object(router.shutil, 'which') as lookup:
+        with patch.object(router.sys, 'platform', 'darwin'), patch.object(Path, 'is_file', return_value=True), patch.object(router, 'os', SimpleNamespace(name='posix', X_OK=1, access=lambda *args: True)), patch.object(router.shutil, 'which') as lookup:
             self.assertEqual(router.find_codex_executable(), str(Path('/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex')))
             lookup.assert_not_called()
 
