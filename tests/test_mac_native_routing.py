@@ -36,7 +36,7 @@ class MacNativeRoutingTests(unittest.TestCase):
 
     def test_desktop_runtime_precedes_stale_path_on_mac(self):
         with patch.object(router.sys, 'platform', 'darwin'), patch.object(Path, 'is_file', return_value=True), patch.object(router.os, 'access', return_value=True), patch.object(router.shutil, 'which') as lookup:
-            self.assertEqual(router.find_codex_executable(), '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex')
+            self.assertEqual(router.find_codex_executable(), str(Path('/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex')))
             lookup.assert_not_called()
 
     def test_missing_desktop_runtime_keeps_path_fallback(self):
