@@ -14,6 +14,7 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
-ROUTER_VERSION = "0.9.1"
+ROUTER_VERSION = "0.9.2"
 PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
 CODEX_EVALUATOR_MODEL = "gpt-6-sol"
 CODEX_EVALUATOR_EFFORT = "medium"
@@ -196,6 +197,12 @@ def find_codex_executable() -> str:
             if native_matches:
                 return str(native_matches[-1])
 
+    # Mac 桌面运行时与 standalone 可并存，选用桌面随附的模型目录与执行器。
+    if sys.platform == "darwin":
+        bundled = Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
+        if bundled.is_file() and os.access(str(bundled), os.X_OK):
+            return str(bundled)
+
     candidates = ["codex.exe", "codex"] if os.name == "nt" else ["codex"]
     for candidate in candidates:
         resolved = shutil.which(candidate)
@@ -211,7 +218,7 @@ def _catalog_from_payload(payload: Mapping[str, Any]) -> ModelCatalog:
             continue
         slug = entry.get("slug")
         levels = entry.get("supported_reasoning_levels", [])
-        if not isinstance(slug, str) or not slug.startswith("gpt-6-") or _model_family(slug) == "unknown":
+        if not isinstance(slug, str) or re.match(r"^gpt-6(?:\.\d+)?-", slug) is None or _model_family(slug) == "unknown":
             continue
         efforts: List[str] = []
         for level in levels:
@@ -345,7 +352,7 @@ def _read_catalog_cache(path: Path) -> Optional[ModelCatalog]:
     for model, efforts in raw_models.items():
         if not isinstance(model, str) or not isinstance(efforts, list):
             continue
-        if not model.startswith("gpt-6-") or _model_family(model) == "unknown":
+        if re.match(r"^gpt-6(?:\.\d+)?-", model) is None or _model_family(model) == "unknown":
             continue
         normalized = tuple(
             effort for effort in efforts if effort in EFFORT_ORDER
@@ -438,6 +445,9 @@ def configure_catalog(catalog: ModelCatalog, payload: Mapping[str, Any]) -> Mode
         raise ValueError("routing must be an object")
     additions = routing.get("models", {})
     preferred = routing.get("preferred_models", [])
+    excluded = routing.get("excluded_models", [])
+    if not isinstance(excluded, list) or any(not isinstance(model, str) for model in excluded):
+        raise ValueError("excluded_models must be a list of model IDs")
     if not isinstance(additions, Mapping) or not isinstance(preferred, list):
         raise ValueError("routing.models must be an object and preferred_models a list")
     models = dict(catalog.models)
@@ -447,6 +457,8 @@ def configure_catalog(catalog: ModelCatalog, payload: Mapping[str, Any]) -> Mode
                 or any(not isinstance(item, str) or item not in EFFORT_ORDER for item in efforts)):
             raise ValueError("Invalid routing model or reasoning efforts")
         models[model] = tuple(dict.fromkeys(efforts))
+    for model in excluded:
+        models.pop(model, None)
     if any(not isinstance(model, str) or model not in models for model in preferred):
         raise ValueError("preferred_models must reference available routing models")
     return ModelCatalog(models, catalog.source, tuple(preferred))
@@ -2065,10 +2077,23 @@ def catalog_for_parent(catalog: ModelCatalog, parent_model: str) -> Optional[Mod
                         tuple(m for m in catalog.preferred_models if m in models))
 
 
-def _inherit_hook_input(tool_input: Mapping[str, Any]) -> Dict[str, Any]:
+def _inherit_hook_input(tool_input: Mapping[str, Any], payload: Optional[Mapping[str, Any]] = None,
+                        reason: str = "unknown_parent_model", no_log: bool = True) -> Dict[str, Any]:
     updated = dict(tool_input)
     for key in ("model", "reasoning_effort"):
         updated.pop(key, None)
+    if not no_log:
+        record = {"event": "route_skipped", "timestamp": datetime.now(timezone.utc).isoformat(),
+                  "router_version": ROUTER_VERSION, "reason": reason, "action": "inherit_parent",
+                  "task_name": updated.get("task_name"),
+                  "codex_session_id": (payload or {}).get("session_id") or (payload or {}).get("thread_id")}
+        try:
+            path = default_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            pass
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
             "permissionDecision": "allow", "updatedInput": updated}}
 
@@ -2104,10 +2129,10 @@ def run_hook(
     if _is_encrypted_agent_task(task):
         return _encrypted_task_hook(payload, tool_input, parent_model, no_log)
     if not parent_model:
-        return _inherit_hook_input(tool_input)
+        return _inherit_hook_input(tool_input, payload, "unknown_parent_model", no_log)
     if (preserve_model and tool_input.get("model")
             and model_backend(str(tool_input["model"])) != model_backend(parent_model)):
-        return _inherit_hook_input(tool_input)
+        return _inherit_hook_input(tool_input, payload, "cross_backend_model", no_log)
 
     if preserve_model and tool_input.get("model"):
         decision = _explicit_model_decision(task, tool_input)
@@ -2141,7 +2166,7 @@ def run_hook(
 
     active_catalog = catalog_for_parent(discover_catalog(), parent_model)
     if active_catalog is None:
-        return _inherit_hook_input(tool_input)
+        return _inherit_hook_input(tool_input, payload, "incomplete_backend_catalog", no_log)
     decision = route_task(
         task,
         catalog=active_catalog,
