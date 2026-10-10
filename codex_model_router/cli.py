@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("task", nargs="*", help="Task text; stdin is used when omitted")
+    parser.add_argument("--refresh-models", action="store_true", help="Refresh managed native v1 metadata without a model call")
     parser.add_argument("--prompt", help="Task text as a named argument")
     parser.add_argument(
         "--route-only",
@@ -168,6 +169,23 @@ def _try_log_decision(*args, **kwargs) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.refresh_models:
+        from .router import _load_router_config
+        from .lifecycle import sync_native_catalog, refresh_registry
+        if args.hook or args.prompt is not None or args.task:
+            parser.error("--refresh-models does not accept a hook or task")
+        try:
+            payload = _load_router_config()
+            refresh_registry(payload)
+            updated = sync_native_catalog(find_codex_executable(), payload)
+            catalog = discover_catalog()
+            print(json.dumps({"updated": updated is not None, "models": catalog.candidate_models(),
+                              "retired": catalog.replacements, "evidence": catalog.evidence,
+                              "policy_revision": catalog.policy_revision}, indent=2))
+            return 0
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            parser.error("Could not refresh models: {0}".format(exc))
 
     if args.hook:
         return _run_hook(args)

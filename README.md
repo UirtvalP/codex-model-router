@@ -16,6 +16,11 @@ This is an MVP, not an official OpenAI project.
 
 ## Routes
 
+Version 0.10 adds opt-in native catalog maintenance and reviewed model lifecycle
+policy. See [model lifecycle](docs/model-lifecycle.md) for evidence, cost scope,
+refresh, explicit pins and subscription limitations. Native future generations
+are eligible; model names do not establish capability or price improvements.
+
 | Family | Intended role |
 | --- | --- |
 | Luna | Classification, formatting, bounded answers, tiny deterministic work |

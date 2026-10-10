@@ -24,8 +24,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from . import lifecycle
 
-ROUTER_VERSION = "0.9.3"
+
+ROUTER_VERSION = "0.10.0"
 PRE_SPAWN_TTL_SECONDS = 300
 PRESERVE_MODEL_MARKER = "[codex-router:preserve-model]"
 CODEX_EVALUATOR_MODEL = "gpt-6-sol"
@@ -83,6 +85,9 @@ class ModelCatalog:
     models: Dict[str, Tuple[str, ...]]
     source: str = "fallback"
     preferred_models: Tuple[str, ...] = ()
+    replacements: Dict[str, str] = field(default_factory=dict)
+    evidence: Tuple[str, ...] = ()
+    policy_revision: str = ""
 
     def preferred(self, family: str) -> str:
         for model in self.preferred_models + tuple(self.models):
@@ -97,14 +102,11 @@ class ModelCatalog:
         return self.models.get(model, ())
 
     def candidate_models(self) -> List[str]:
-        preferred = [
-            self.preferred("luna"),
-            self.preferred("sol"),
-        ]
-        astra = [self.preferred("astra")] if any(
-            _model_family(model) == "astra" for model in self.models
-        ) else []
-        return list(dict.fromkeys(preferred + astra))
+        candidates = []
+        for family in ("luna", "sol", "astra"):
+            pinned = [m for m in self.preferred_models if _model_family(m) == family and m in self.models]
+            candidates.extend(pinned or [m for m in self.models if _model_family(m) == family])
+        return list(dict.fromkeys(candidates))
 
 
 @dataclass(frozen=True)
@@ -219,7 +221,7 @@ def _catalog_from_payload(payload: Mapping[str, Any]) -> ModelCatalog:
             continue
         slug = entry.get("slug")
         levels = entry.get("supported_reasoning_levels", [])
-        if not isinstance(slug, str) or re.match(r"^gpt-6(?:\.\d+)?-", slug) is None or _model_family(slug) == "unknown":
+        if not isinstance(slug, str) or not lifecycle.native_model(slug):
             continue
         efforts: List[str] = []
         for level in levels:
@@ -299,7 +301,7 @@ def _resolve_evaluator_backend(model: str, backend: Any) -> str:
     return backend
 
 
-def load_evaluator_config(path: Optional[Path] = None) -> EvaluatorConfig:
+def load_evaluator_config(path: Optional[Path] = None, catalog: Optional[ModelCatalog] = None) -> EvaluatorConfig:
     """Load and validate evaluator configuration for one routing invocation."""
     payload = _load_router_config(path)
     evaluator = payload.get("evaluator", {})
@@ -316,6 +318,20 @@ def load_evaluator_config(path: Optional[Path] = None) -> EvaluatorConfig:
     if not isinstance(fast, bool):
         raise ValueError("Codex evaluator config fast must be boolean")
     backend = _resolve_evaluator_backend(model, evaluator.get("backend"))
+    selection = evaluator.get("selection", "fixed" if "model" in evaluator else "auto")
+    if selection not in ("fixed", "auto"):
+        raise ValueError("Evaluator selection must be fixed or auto")
+    if selection == "auto" and backend == "codex" and catalog is not None:
+        active = catalog
+        model = active.replacements.get(model, model)
+        if model not in active.models:
+            candidates = [m for m in active.models if _model_family(m) == _model_family(model)
+                          and model_backend(m) == model_backend(model)]
+            if not candidates:
+                raise ValueError("No enabled evaluator candidate on the configured backend")
+            model = candidates[0]
+        if not active.supports(model, effort):
+            raise ValueError("Automatic evaluator replacement does not support its configured effort")
     agent_executable = evaluator.get("agent_executable")
     timeout_seconds = evaluator.get("timeout_seconds")
     if backend == CURSOR_EVALUATOR_BACKEND:
@@ -350,10 +366,14 @@ def _read_catalog_cache(path: Path) -> Optional[ModelCatalog]:
     if not isinstance(raw_models, Mapping):
         return None
     models: Dict[str, Tuple[str, ...]] = {}
-    for model, efforts in raw_models.items():
+    order = payload.get("model_order", list(raw_models))
+    if not isinstance(order, list) or set(order) != set(raw_models) or len(order) != len(raw_models):
+        return None
+    for model in order:
+        efforts = raw_models[model]
         if not isinstance(model, str) or not isinstance(efforts, list):
             continue
-        if re.match(r"^gpt-6(?:\.\d+)?-", model) is None or _model_family(model) == "unknown":
+        if not lifecycle.native_model(model):
             continue
         normalized = tuple(
             effort for effort in efforts if effort in EFFORT_ORDER
@@ -375,6 +395,7 @@ def _write_catalog_cache(path: Path, catalog: ModelCatalog) -> None:
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "models": {model: list(efforts) for model, efforts in catalog.models.items()},
+        "model_order": list(catalog.models),
     }
     temporary = path.with_name(
         "{0}.{1}.{2}.tmp".format(path.name, os.getpid(), uuid.uuid4().hex)
@@ -398,6 +419,15 @@ def discover_catalog(
     """Read the installed CLI catalog, with a conservative offline fallback."""
 
     active_cache_path = cache_path or default_catalog_cache_path()
+    payload = _load_router_config()
+    refresh = lifecycle.settings(payload).get("native_refresh", {})
+    if isinstance(refresh, Mapping) and refresh.get("enabled") is True:
+        # Maintenance owns refresh; a spawn only reads the last atomic snapshot.
+        try:
+            managed = lifecycle.validate_snapshot(json.loads(Path(refresh["catalog_path"]).read_text(encoding="utf-8")))
+            return configure_catalog(_catalog_from_payload(managed), payload)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     cached: Optional[ModelCatalog] = None
     try:
         cached = _read_catalog_cache(active_cache_path)
@@ -462,7 +492,13 @@ def configure_catalog(catalog: ModelCatalog, payload: Mapping[str, Any]) -> Mode
         models.pop(model, None)
     if any(not isinstance(model, str) or model not in models for model in preferred):
         raise ValueError("preferred_models must reference available routing models")
-    return ModelCatalog(models, catalog.source, tuple(preferred))
+    retired, evidence, revision = lifecycle.replacements(models, payload)
+    # 明确的候选固定是用户选择，不属于自动淘汰；不改写这些 ID。
+    retired = {old: new for old, new in retired.items() if old not in preferred}
+    for model in retired:
+        models.pop(model, None)
+    preferred = list(dict.fromkeys(retired.get(model, model) for model in preferred))
+    return ModelCatalog(models, catalog.source, tuple(preferred), retired, evidence, revision)
 
 
 def _empty_safety() -> Dict[str, bool]:
@@ -678,6 +714,8 @@ def _task_excerpt(task: str, limit: int = 12000) -> str:
 
 def _classifier_prompt(task: str, surface: str, catalog: ModelCatalog) -> str:
     candidates = ", ".join(catalog.candidate_models())
+    if catalog.evidence:
+        candidates += "\nReviewed capability comparisons (not price equivalence): " + "; ".join(catalog.evidence)
     return (
         "Route one Codex task. Return only the JSON object required by the output schema. "
         "Choose the model whose reasoning capability best fits the task. Correctness and "
@@ -950,7 +988,7 @@ def classify_with_codex(
 
     if os.environ.get(CODEX_EVALUATOR_GUARD):
         raise RuntimeError("recursive Codex evaluator invocation blocked")
-    active_evaluator_config = evaluator_config or load_evaluator_config()
+    active_evaluator_config = evaluator_config or load_evaluator_config(catalog=catalog)
     executable = codex_executable or find_codex_executable()
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="codex-router-evaluator-") as temp_dir:
@@ -1078,7 +1116,7 @@ def classify_with_cursor(
 
     if os.environ.get(CODEX_EVALUATOR_GUARD):
         raise RuntimeError("recursive Codex evaluator invocation blocked")
-    active_evaluator_config = evaluator_config or load_evaluator_config()
+    active_evaluator_config = evaluator_config or load_evaluator_config(catalog=catalog)
     if active_evaluator_config.backend != CURSOR_EVALUATOR_BACKEND:
         raise ValueError("Cursor evaluator requires backend=cursor")
     if not active_evaluator_config.agent_executable:
@@ -1303,7 +1341,7 @@ def route_task(
         evaluator_started = time.perf_counter()
         evaluator_config = EvaluatorConfig()
         try:
-            evaluator_config = load_evaluator_config()
+            evaluator_config = load_evaluator_config(catalog=active_catalog)
             if evaluator_config.backend == CURSOR_EVALUATOR_BACKEND:
                 choice = classify_with_cursor(
                     task,
@@ -2075,7 +2113,9 @@ def catalog_for_parent(catalog: ModelCatalog, parent_model: str) -> Optional[Mod
     if not all(any(_model_family(m) == f for m in models) for f in ("luna", "sol", "astra")):
         return None
     return ModelCatalog(models, catalog.source,
-                        tuple(m for m in catalog.preferred_models if m in models))
+                        tuple(m for m in catalog.preferred_models if m in models),
+                        {old: new for old, new in catalog.replacements.items() if new in models},
+                        catalog.evidence, catalog.policy_revision)
 
 
 def _inherit_hook_input(tool_input: Mapping[str, Any], payload: Optional[Mapping[str, Any]] = None,
@@ -2107,7 +2147,7 @@ def pre_spawn_binding(task: str, session_id: Optional[str], task_name: Optional[
     policy = {"config": _load_router_config(), "models": catalog.models,
               "model_order": list(catalog.models),
               "preferred": catalog.preferred_models, "timeout": timeout_seconds,
-              "version": ROUTER_VERSION}
+              "version": ROUTER_VERSION, "policy_revision": catalog.policy_revision}
     values = {"task": task.strip(), "session": session_id,
               "name": normalize_spawn_task_name(task_name), "cwd": _normalized_cwd(cwd),
               "policy": policy}
